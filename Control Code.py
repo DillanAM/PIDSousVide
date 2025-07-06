@@ -4,17 +4,17 @@ from PyQt5.QtWidgets import (
     QComboBox, QWidget, QGridLayout, QMessageBox
 )
 from PyQt5.QtCore import Qt, QTimer
-from bleak import BleakClient
-from bleak import BleakError
+from bleak import (BleakClient, BleakError)
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 import matplotlib.pyplot as plt
+import csv
 
 GRAPH_INTERVAL = 1000           # ms between redraws
 CONTROL_INTERVAL = 30           # s between PID decisions
 COOKER_MAC = "94:A9:A8:19:77:5F"
 PROBE_MAC = "C2:71:23:E2:CF:E0"
 
-'''
+
 def exporter(time_s, core_temp, amb_temp, state, PID_gains, file_name):
 
     with open(str(file_name), 'w', newline='') as csvfile:
@@ -24,7 +24,7 @@ def exporter(time_s, core_temp, amb_temp, state, PID_gains, file_name):
         writer.writerow(amb_temp)
         writer.writerow(state)
         writer.writerow(PID_gains)
-'''
+
 
 
 class PIDController:
@@ -315,22 +315,22 @@ class MainWindow(QMainWindow):
     # ---------- BLE connect/disconnect ----------
     async def handle_probe(self):
         try:
-            if await self.thermo.is_connected():
-                await self.thermo.disconnect()
+            if await self.thermo.connection_status():
+                await self.thermo.disconnect_routine()
                 self.lbl_probe.setText("Probe: ⬤ Disconnected")
             else:
-                await self.thermo.connect()
+                await self.thermo.connect_routine()
                 self.lbl_probe.setText("Probe: ⬤ Connected")
         except BleakError as e:
             QMessageBox.warning(self,"Probe Error",str(e))
 
     async def handle_cooker(self):
         try:
-            if await self.cooker.is_connected():
-                await self.cooker.disconnect()
+            if await self.cooker.connection_status():
+                await self.cooker.disconnect_routine()
                 self.lbl_cooker.setText("Cooker: ⬤ Disconnected")
             else:
-                await self.cooker.connect()
+                await self.cooker.connect_routine()
                 self.lbl_cooker.setText("Cooker: ⬤ Connected")
         except BleakError as e:
             QMessageBox.warning(self,"Cooker Error",str(e))
@@ -340,7 +340,7 @@ class MainWindow(QMainWindow):
         if self.task_loop:
             QMessageBox.information(self,"Running","Loop already running")
             return
-        if not (await self.thermo.is_connected() and await self.cooker.is_connected()):
+        if not (await self.thermo.connection_status() and await self.cooker.connection_status()):
             QMessageBox.warning(self,"Not connected","Connect probe and cooker first")
             return
 
@@ -356,14 +356,14 @@ class MainWindow(QMainWindow):
         if self.task_loop:
             await self.task_loop
             self.task_loop = None
-        await self.cooker.dwell()
+        await self.cooker.manual_dwelling()
 
     async def loop(self, mode):
         try:
             last = time.time()
             while self.running:
                 try:
-                    core,surf,water = await self.thermo.temperatures()
+                    core,surf,water = await self.thermo.temperature_read()
                 except Exception as e:
                     self.statusBar().showMessage(f"Probe read error: {e}")
                     await asyncio.sleep(2); continue
@@ -377,19 +377,19 @@ class MainWindow(QMainWindow):
                     pass                    # nothing – user drives via cooker’s buttons
                 else:
                     dt = now - last; last = now
-                    out = self.pid(water if mode=="Normal" else core, dt)
+                    out = self.pid.calculate(water if mode=="Normal" else core, dt)
 
                     if mode=="Normal":
-                        if out>0.5:  await self.cooker.heat()
-                        else:        await self.cooker.dwell()
+                        if out>0.5:  await self.cooker.manual_heating()
+                        else:        await self.cooker.manual_dwelling()
                     elif mode=="PID Auto":
-                        if out>5:          await self.cooker.heat()
-                        elif out<-5:       await self.cooker.cool()
-                        else:              await self.cooker.dwell()
+                        if out>5:          await self.cooker.manual_heating()
+                        elif out<-5:       await self.cooker.manual_cooling()
+                        else:              await self.cooker.manual_dwelling()
 
                 await asyncio.sleep(CONTROL_INTERVAL)
         finally:
-            await self.cooker.dwell()
+            await self.cooker.manual_dwelling()
 
     # ---------- graph redraw ----------
     def redraw(self):
