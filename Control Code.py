@@ -1,18 +1,20 @@
-import asyncio
-import time as time
-import csv
-
-import bleak.exc
-import numpy as np
-import scipy
-import math
+import asyncio, sys, time, numpy as np, qasync
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QPushButton, QLabel, QSpinBox, QDoubleSpinBox,
+    QComboBox, QWidget, QGridLayout, QMessageBox
+)
+from PyQt5.QtCore import Qt, QTimer
 from bleak import BleakClient
+from bleak import BleakError
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 import matplotlib.pyplot as plt
 
-cooker_address = '94:A9:A8:19:77:5F'
-thermoprobe_address = "C2:71:23:E2:CF:E0"
+GRAPH_INTERVAL = 1000           # ms between redraws
+CONTROL_INTERVAL = 30           # s between PID decisions
+COOKER_MAC = "94:A9:A8:19:77:5F"
+PROBE_MAC = "C2:71:23:E2:CF:E0"
 
-
+'''
 def exporter(time_s, core_temp, amb_temp, state, PID_gains, file_name):
 
     with open(str(file_name), 'w', newline='') as csvfile:
@@ -22,7 +24,7 @@ def exporter(time_s, core_temp, amb_temp, state, PID_gains, file_name):
         writer.writerow(amb_temp)
         writer.writerow(state)
         writer.writerow(PID_gains)
-
+'''
 
 
 class PIDController:
@@ -233,158 +235,184 @@ class cooker:
         return initial_time, state
 
 
-async def main(cooker_address, thermoprobe_address):
+class MatplotCanvas(FigureCanvasQTAgg):
+    def __init__(self, parent=None):
+        self.fig, self.ax = plt.subplots(figsize=(6,3), tight_layout=True)
+        super().__init__(self.fig)
+        self.setParent(parent)
+        self.ax.set_xlabel("Time [s]")
+        self.ax.set_ylabel("T [°C]")
+        self.lines = {
+            "core":  self.ax.plot([], [], 'r-', label="Core")[0],
+            "water": self.ax.plot([], [], 'b-', label="Water")[0],
+            "set":   self.ax.plot([], [], 'k--',label="Set‑point")[0],
+        }
+        self.ax.legend()
+    def update(self, t, core, water, setpoint):
+        for k, y in [("core",core),("water",water),("set",np.full_like(core,setpoint))]:
+            self.lines[k].set_data(t, y)
+        self.ax.relim(); self.ax.autoscale_view()
+        self.draw_idle()
 
-    sous_vide = cooker(cooker_address)
-    thermometer = thermoprobe(thermoprobe_address)
+class MainWindow(QMainWindow):
 
-    try:
-        await sous_vide.connect_routine()
-        await thermometer.connect_routine()
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Sous‑Vide Control GUI")
+        self.resize(880,480)
 
-        while True:
+        # ---------- widgets ----------
+        self.btn_probe   = QPushButton("Connect Probe")
+        self.btn_cooker  = QPushButton("Connect Cooker")
+        self.lbl_probe   = QLabel("Probe: ⬤ Disconnected")
+        self.lbl_cooker  = QLabel("Cooker: ⬤ Disconnected")
 
-            await sous_vide.manual_standby()
+        self.modeBox     = QComboBox()
+        self.modeBox.addItems(["Manual", "Normal", "PID Auto"])
+        self.sp_set      = QSpinBox(); self.sp_set.setRange(20, 95); self.sp_set.setValue(55)
+        self.kpBox       = QDoubleSpinBox(); self.kpBox.setRange(0,100); self.kpBox.setValue(1.0)
+        self.kiBox       = QDoubleSpinBox(); self.kiBox.setRange(0,100); self.kiBox.setValue(0.0)
+        self.kdBox       = QDoubleSpinBox(); self.kdBox.setRange(0,2000); self.kdBox.setValue(0.0)
 
-            mode = input('Mode: (Manual, Auto, Normal, END)\n')
+        self.lbl_core    = QLabel("Core: --.- °C")
+        self.lbl_water   = QLabel("Water: --.- °C")
+        self.btn_start   = QPushButton("Start")
+        self.btn_stop    = QPushButton("Stop")
+        self.graph       = MatplotCanvas(self)
 
-            if mode == 'Normal':
+        # ---------- layout ----------
+        g = QGridLayout()
+        g.addWidget(self.btn_probe, 0,0);  g.addWidget(self.lbl_probe, 0,1)
+        g.addWidget(self.btn_cooker,1,0);  g.addWidget(self.lbl_cooker,1,1)
+        g.addWidget(QLabel("Mode:"),       2,0); g.addWidget(self.modeBox,2,1)
+        g.addWidget(QLabel("Set‑point °C"),3,0); g.addWidget(self.sp_set,3,1)
+        g.addWidget(QLabel("Kp"),4,0); g.addWidget(self.kpBox,4,1)
+        g.addWidget(QLabel("Ki"),5,0); g.addWidget(self.kiBox,5,1)
+        g.addWidget(QLabel("Kd"),6,0); g.addWidget(self.kdBox,6,1)
+        g.addWidget(self.lbl_core,7,0,1,2);  g.addWidget(self.lbl_water,8,0,1,2)
+        g.addWidget(self.btn_start,9,0);     g.addWidget(self.btn_stop,9,1)
+        g.addWidget(self.graph,0,2,10,1)
 
-                temp_target = float(input('Target Temperature in Celsius\n'))
-                kp, ki, kd = 1, 0, 0
-                pid = PIDController(kp=kp, ki=ki, kd=kd, target_temperature=temp_target)
-                initial_time = time.time()
-                start_time = initial_time
+        central = QWidget(); central.setLayout(g)
+        self.setCentralWidget(central)
 
-                filename = 'PID Test 7'
-                core_temp_log = []
-                amb_temp_log = []
-                time_log = []
-                state_log = []
+        # ---------- state ----------
+        self.thermo  = thermoprobe(PROBE_MAC)
+        self.cooker  = cooker(COOKER_MAC)
+        self.task_loop = None           # background async loop task
+        self.t, self.core, self.water = [],[],[]
 
-                while True:
+        # ---------- signals ----------
+        self.btn_probe.clicked.connect(lambda: asyncio.create_task(self.handle_probe()))
+        self.btn_cooker.clicked.connect(lambda: asyncio.create_task(self.handle_cooker()))
+        self.btn_start.clicked.connect(lambda: asyncio.create_task(self.start_loop()))
+        self.btn_stop.clicked.connect(lambda: asyncio.create_task(self.stop_loop()))
 
-                    try:
-                        current_temperature = await thermometer.temperature_read()
+        # auto‑refresh graph timer
+        self.timer = QTimer(self); self.timer.timeout.connect(self.redraw)
+        self.timer.start(GRAPH_INTERVAL)
 
-                        core_temp_log.append(current_temperature[0])
-                        amb_temp_log.append(current_temperature[2])
-                        time_log.append(time.time() - start_time)
+    # ---------- BLE connect/disconnect ----------
+    async def handle_probe(self):
+        try:
+            if await self.thermo.is_connected():
+                await self.thermo.disconnect()
+                self.lbl_probe.setText("Probe: ⬤ Disconnected")
+            else:
+                await self.thermo.connect()
+                self.lbl_probe.setText("Probe: ⬤ Connected")
+        except BleakError as e:
+            QMessageBox.warning(self,"Probe Error",str(e))
 
-                        initial_time, state = await sous_vide.normal_control(
-                            current_temperature=current_temperature,
-                            pid=pid, cycle_time=15.0, initial_time=initial_time)
+    async def handle_cooker(self):
+        try:
+            if await self.cooker.is_connected():
+                await self.cooker.disconnect()
+                self.lbl_cooker.setText("Cooker: ⬤ Disconnected")
+            else:
+                await self.cooker.connect()
+                self.lbl_cooker.setText("Cooker: ⬤ Connected")
+        except BleakError as e:
+            QMessageBox.warning(self,"Cooker Error",str(e))
 
-                        state_log.append(state)
+    # ---------- main control loop ----------
+    async def start_loop(self):
+        if self.task_loop:
+            QMessageBox.information(self,"Running","Loop already running")
+            return
+        if not (await self.thermo.is_connected() and await self.cooker.is_connected()):
+            QMessageBox.warning(self,"Not connected","Connect probe and cooker first")
+            return
 
-                        if current_temperature[0] >= temp_target:
-                            break
+        mode = self.modeBox.currentText()
+        self.running = True
+        self.t0 = time.time()
+        self.pid = PIDController(self.kpBox.value(), self.kiBox.value(),
+                                 self.kdBox.value(), self.sp_set.value())
+        self.task_loop = asyncio.create_task(self.loop(mode))
 
-                    except KeyboardInterrupt:
-                        break
+    async def stop_loop(self):
+        self.running = False
+        if self.task_loop:
+            await self.task_loop
+            self.task_loop = None
+        await self.cooker.dwell()
 
-                    except:
-                        await sous_vide.manual_dwelling()
-                        print('AUTO ERROR')
-                        while not await thermometer.connection_status():
-                            try:
-                                await thermometer.connect_routine()
-                            except bleak.exc.BleakError:
-                                print('Reconnect Failed. Trying Again...')
-                                await asyncio.sleep(10)
-                        await asyncio.sleep(5)
-                        continue
+    async def loop(self, mode):
+        try:
+            last = time.time()
+            while self.running:
+                try:
+                    core,surf,water = await self.thermo.temperatures()
+                except Exception as e:
+                    self.statusBar().showMessage(f"Probe read error: {e}")
+                    await asyncio.sleep(2); continue
 
-                    finally:
-                        exporter(time_log, core_temp_log, amb_temp_log, state_log, [kp, ki, kd],
-                                 filename)
+                now = time.time(); self.t.append(now-self.t0)
+                self.core.append(core); self.water.append(water)
+                self.lbl_core.setText(f"Core: {core:.1f} °C")
+                self.lbl_water.setText(f"Water: {water:.1f} °C")
 
-                print('Cooking Complete')
-                mode = 'END'
-                break
+                if mode=="Manual":
+                    pass                    # nothing – user drives via cooker’s buttons
+                else:
+                    dt = now - last; last = now
+                    out = self.pid(water if mode=="Normal" else core, dt)
 
-            if mode == 'Manual':
-                while True:
+                    if mode=="Normal":
+                        if out>0.5:  await self.cooker.heat()
+                        else:        await self.cooker.dwell()
+                    elif mode=="PID Auto":
+                        if out>5:          await self.cooker.heat()
+                        elif out<-5:       await self.cooker.cool()
+                        else:              await self.cooker.dwell()
 
-                    await sous_vide.manual_dwelling()
+                await asyncio.sleep(CONTROL_INTERVAL)
+        finally:
+            await self.cooker.dwell()
 
-                    manual_control_type = input('Type: Heating, Cooling , END?\n')
+    # ---------- graph redraw ----------
+    def redraw(self):
+        if self.t:
+            self.graph.update(np.array(self.t),
+                              np.array(self.core),
+                              np.array(self.water),
+                              self.sp_set.value())
 
-                    if manual_control_type == 'Heating':
-                        await sous_vide.manual_heating()
-
-                    if manual_control_type == 'Cooling':
-                        await sous_vide.manual_cooling()
-
-                    if manual_control_type == 'END':
-                        break
-
-            if mode == 'Auto':
-
-                temp_target = float(input('Target Temperature in Celsius\n'))
-                kp, ki, kd = 1.175, 0, 650
-                pid = PIDController(kp=kp, ki=ki, kd=kd, target_temperature=temp_target)
-                initial_time = time.time()
-                start_time = initial_time
-                completion_latch = False
-
-                filename = 'PID Test Pork'
-                core_temp_log = []
-                amb_temp_log = []
-                time_log = []
-                state_log = []
-
-                while True:
-
-                    try:
-                        current_temperature = await thermometer.temperature_read()
-
-                        core_temp_log.append(current_temperature[0])
-                        amb_temp_log.append(current_temperature[2])
-                        time_log.append(time.time()-start_time)
-
-                        initial_time, state = await sous_vide.automatic_control(current_temperature=current_temperature,
-                                                                         pid=pid, cycle_time=30.0, initial_time=initial_time)
-
-                        state_log.append(state)
-
-                        if time.time()-start_time >= 5400:
-                            break
-
-                        if current_temperature[0] >= temp_target:
-                            completion_latch = True
-
-                        if completion_latch and current_temperature[0] <= temp_target:
-                            break
-
-                    except KeyboardInterrupt:
-                        break
-
-                    except:
-                        await sous_vide.manual_dwelling()
-                        print('AUTO ERROR')
-                        while not await thermometer.connection_status():
-                            try:
-                                await thermometer.connect_routine()
-                            except bleak.exc.BleakError:
-                                print('Reconnect Failed. Trying Again...')
-                                await asyncio.sleep(10)
-                        await asyncio.sleep(5)
-                        continue
-                    finally:
-                        exporter(time_log, core_temp_log, amb_temp_log, state_log, [kp, ki, kd],
-                                 filename)
-
-                print('Cooking Complete')
-                mode = 'END'
-                break
-
-            if mode == 'END':
-                break
-    finally:
-        await sous_vide.manual_standby()
-        await sous_vide.disconnect_routine()
-        await thermometer.disconnect_routine()
+# ---------------------------------------------------------------------------
+#  =======================  main  ===========================================
+# ---------------------------------------------------------------------------
 
 
-asyncio.run(main(cooker_address, thermoprobe_address))
+def main():
+    app = QApplication(sys.argv)
+    loop = qasync.QEventLoop(app)
+    asyncio.set_event_loop(loop)
+    win = MainWindow(); win.show()
+
+    with loop:
+        loop.run_forever()
+
+
+if __name__ == "__main__":
+    main()
