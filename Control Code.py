@@ -1,10 +1,10 @@
-import asyncio, sys, time, numpy as np, qasync
+import asyncio, sys, time, numpy as np, qasync, json, os
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QPushButton, QLabel, QSpinBox, QDoubleSpinBox,
-    QComboBox, QWidget, QGridLayout, QMessageBox
+    QComboBox, QWidget, QGridLayout, QMessageBox, QFileDialog
 )
 from PyQt5.QtCore import Qt, QTimer
-from bleak import (BleakClient, BleakError)
+from bleak import BleakClient, BleakError
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 import matplotlib.pyplot as plt
 import csv
@@ -13,17 +13,17 @@ GRAPH_INTERVAL = 1000           # ms between redraws
 CONTROL_INTERVAL = 2           # s between PID decisions
 COOKER_MAC = "94:A9:A8:19:77:5F"
 PROBE_MAC = "C2:71:1E:F2:C6:20"
+PID_SETTINGS_FILE = "pid_settings.json"
 
-
-def exporter(time_s, core_temp, amb_temp, state, PID_gains, file_name):
+def exporter(time_s, core_temp, amb_temp, set_temp, state, PID_gains, file_name):
     with open(str(file_name), 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(time_s)
-        writer.writerow(core_temp)
-        writer.writerow(amb_temp)
-        writer.writerow(state)
-        writer.writerow(PID_gains)
-
+        writer.writerow(["Time (s)", *time_s])
+        writer.writerow(["Core Temp (°C)", *core_temp])
+        writer.writerow(["Water Temp (°C)", *amb_temp])
+        writer.writerow(["Set Temp (°C)", set_temp])
+        writer.writerow(["State", *state])
+        writer.writerow(["PID Gains", *PID_gains])
 
 class PIDController:
     def __init__(self, kp, ki, kd, target_temperature):
@@ -42,7 +42,6 @@ class PIDController:
         d = self.kd * (error - self.previous_error) / dt
         self.previous_error = error
         return p + i + d
-
 
 class thermoprobe:
     UUID = '00000101-CAAB-3792-3D44-97AE51C1407A'
@@ -82,7 +81,6 @@ class thermoprobe:
             temps[-i - 1] = int(temperature_bits[13 * (i):13 * (i + 1)], 2) * 0.05 - 20
         return [temps[core_ID].item(), temps[surface_ID].item(), temps[ambient_ID].item()]
 
-
 class cooker:
     UUID = '0000ffe1-0000-1000-8000-00805f9b34fb'
 
@@ -119,7 +117,6 @@ class cooker:
     async def cool(self):
         await self.BLE_Object.write_gatt_char(self.UUID, b'2')
 
-
 class MatplotCanvas(FigureCanvasQTAgg):
     def __init__(self, parent=None):
         self.fig, self.ax = plt.subplots(figsize=(6,3), tight_layout=True)
@@ -137,9 +134,9 @@ class MatplotCanvas(FigureCanvasQTAgg):
     def plot_data(self, t, core, water, setpoint):
         for k, y in [("core",core),("water",water),("set",np.full_like(core,setpoint))]:
             self.lines[k].set_data(t, y)
-        self.ax.relim(); self.ax.autoscale_view()
+        self.ax.relim()
+        self.ax.autoscale_view()
         self.draw_idle()
-
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -170,6 +167,7 @@ class MainWindow(QMainWindow):
         self.btn_cool    = QPushButton("Cool")
         self.btn_dwell   = QPushButton("Dwell")
         self.btn_standby = QPushButton("Standby")
+        self.btn_export  = QPushButton("Export Data")
 
         self.graph       = MatplotCanvas(self)
 
@@ -186,9 +184,11 @@ class MainWindow(QMainWindow):
         g.addWidget(self.btn_start,9,0);     g.addWidget(self.btn_stop,9,1)
         g.addWidget(self.btn_heat,10,0);     g.addWidget(self.btn_cool,10,1)
         g.addWidget(self.btn_dwell,11,0);    g.addWidget(self.btn_standby,11,1)
-        g.addWidget(self.graph,0,2,12,1)
+        g.addWidget(self.btn_export,12,0,1,2)
+        g.addWidget(self.graph,0,2,13,1)
 
-        central = QWidget(); central.setLayout(g)
+        central = QWidget()
+        central.setLayout(g)
         self.setCentralWidget(central)
 
         # ---------- state ----------
@@ -196,6 +196,10 @@ class MainWindow(QMainWindow):
         self.cooker  = cooker(COOKER_MAC)
         self.task_loop = None
         self.t, self.core, self.water = [],[],[]
+        self.running = False
+
+        # Load PID gains from file if available
+        self.load_pid_settings()
 
         # ---------- signals ----------
         self.btn_probe.clicked.connect(lambda: asyncio.create_task(self.handle_probe()))
@@ -206,9 +210,11 @@ class MainWindow(QMainWindow):
         self.btn_cool.clicked.connect(lambda: asyncio.create_task(self.cooker.cool()))
         self.btn_dwell.clicked.connect(lambda: asyncio.create_task(self.cooker.dwell()))
         self.btn_standby.clicked.connect(lambda: asyncio.create_task(self.cooker.standby()))
+        self.btn_export.clicked.connect(self.export_data)
 
-        # auto‑refresh graph timer
-        self.timer = QTimer(self); self.timer.timeout.connect(self.redraw)
+        # auto-refresh graph timer
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.redraw)
         self.timer.start(GRAPH_INTERVAL)
         self.mode_changed("Manual")
 
@@ -219,8 +225,33 @@ class MainWindow(QMainWindow):
         self.btn_dwell.setEnabled(enabled)
         self.btn_standby.setEnabled(enabled)
 
+    def load_pid_settings(self):
+        if os.path.exists(PID_SETTINGS_FILE):
+            try:
+                with open(PID_SETTINGS_FILE, 'r') as f:
+                    data = json.load(f)
+                    self.kpBox.setValue(data.get('kp', 1.0))
+                    self.kiBox.setValue(data.get('ki', 0.0))
+                    self.kdBox.setValue(data.get('kd', 0.0))
+            except Exception as e:
+                print(f"Failed to load PID settings: {e}")
+
+    def save_pid_settings(self):
+        data = {
+            'kp': self.kpBox.value(),
+            'ki': self.kiBox.value(),
+            'kd': self.kdBox.value()
+        }
+        try:
+            with open(PID_SETTINGS_FILE, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"Failed to save PID settings: {e}")
+
     async def handle_probe(self):
         try:
+            self.lbl_probe.setText("Probe: ⬤ Connecting...")
+            self.btn_probe.setEnabled(False)
             if await self.thermo.connection_status():
                 await self.thermo.disconnect_routine()
                 self.lbl_probe.setText("Probe: ⬤ Disconnected")
@@ -231,9 +262,15 @@ class MainWindow(QMainWindow):
                 self.btn_probe.setText("Disconnect Probe")
         except BleakError as e:
             QMessageBox.warning(self,"Probe Error",str(e))
+            self.lbl_probe.setText("Probe: ⬤ Disconnected")
+            self.btn_probe.setText("Connect Probe")
+        finally:
+            self.btn_probe.setEnabled(True)
 
     async def handle_cooker(self):
         try:
+            self.lbl_cooker.setText("Cooker: ⬤ Connecting...")
+            self.btn_cooker.setEnabled(False)
             if await self.cooker.connection_status():
                 await self.cooker.disconnect_routine()
                 self.lbl_cooker.setText("Cooker: ⬤ Disconnected")
@@ -244,6 +281,10 @@ class MainWindow(QMainWindow):
                 self.btn_cooker.setText("Disconnect Cooker")
         except BleakError as e:
             QMessageBox.warning(self,"Cooker Error",str(e))
+            self.lbl_cooker.setText("Cooker: ⬤ Disconnected")
+            self.btn_cooker.setText("Connect Cooker")
+        finally:
+            self.btn_cooker.setEnabled(True)
 
     async def start_loop(self):
         if self.task_loop:
@@ -253,12 +294,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self,"Not connected","Connect probe and cooker first")
             return
 
-        self.t.clear(); self.core.clear(); self.water.clear()
+        self.t.clear()
+        self.core.clear()
+        self.water.clear()
+
         mode = self.modeBox.currentText()
         self.running = True
         self.t0 = time.time()
         self.pid = PIDController(self.kpBox.value(), self.kiBox.value(),
                                  self.kdBox.value(), self.sp_set.value())
+
         self.task_loop = asyncio.create_task(self.loop(mode))
 
     async def stop_loop(self):
@@ -276,31 +321,36 @@ class MainWindow(QMainWindow):
                     core,surf,water = await self.thermo.temperature_read()
                 except Exception as e:
                     self.statusBar().showMessage(f"Probe read error: {e}")
-                    await asyncio.sleep(2); continue
-
+                    await asyncio.sleep(2)
+                    continue
                 now = time.time()
-                self.t.append(now-self.t0)
+                self.t.append(now - self.t0)
                 self.core.append(core)
                 self.water.append(water)
                 self.lbl_core.setText(f"Core: {core:.1f} °C")
                 self.lbl_water.setText(f"Water: {water:.1f} °C")
                 self.redraw()
-
-                if mode=="Manual":
+                if mode == "Manual":
                     pass
                 else:
-                    dt = now - last; last = now
-                    out = self.pid.calculate(water if mode=="Normal" else core, dt)
-                    if mode=="Normal":
-                        if out>0.5:  await self.cooker.heat()
-                        else:        await self.cooker.dwell()
-                    elif mode=="PID Auto":
-                        if out>5:         await self.cooker.heat()
-                        elif out<-5:      await self.cooker.cool()
-                        else:             await self.cooker.dwell()
+                    dt = now - last
+                    last = now
+                    out = self.pid.calculate(water if mode == "Normal" else core, dt)
+                    if mode == "Normal":
+                        if out > 0.5:
+                            await self.cooker.heat()
+                        else:
+                            await self.cooker.dwell()
+                    elif mode == "PID Auto":
+                        if out > 5:
+                            await self.cooker.heat()
+                        elif out < -5:
+                            await self.cooker.cool()
+                        else:
+                            await self.cooker.dwell()
                 await asyncio.sleep(CONTROL_INTERVAL)
         finally:
-            pass
+            await self.cooker.standby()
 
     def redraw(self):
         if self.t:
@@ -309,15 +359,29 @@ class MainWindow(QMainWindow):
                                  np.array(self.water),
                                  self.sp_set.value())
 
+    def export_data(self):
+        if not self.t:
+            QMessageBox.information(self, "No Data", "There is no data to export.")
+            return
+
+        filename, _ = QFileDialog.getSaveFileName(self, "Save CSV", "sous_vide_data.csv", "CSV Files (*.csv)")
+        if filename:
+            pid_values = [self.kpBox.value(), self.kiBox.value(), self.kdBox.value()]
+            exporter(self.t, self.core, self.water, self.sp_set.value(), ["running"]*len(self.t), pid_values, filename)
+
+    def closeEvent(self, event):
+        # Save PID settings on exit
+        self.save_pid_settings()
+        event.accept()
 
 def main():
     app = QApplication(sys.argv)
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
-    win = MainWindow(); win.show()
+    win = MainWindow()
+    win.show()
     with loop:
         loop.run_forever()
-
 
 if __name__ == "__main__":
     main()
