@@ -1,12 +1,14 @@
 import asyncio, sys, time, numpy as np, qasync, json, os
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QPushButton, QLabel, QSpinBox, QDoubleSpinBox,
-    QComboBox, QWidget, QGridLayout, QMessageBox, QFileDialog
+    QComboBox, QWidget, QGridLayout, QMessageBox, QFileDialog, QTabWidget, QVBoxLayout
 )
 from PyQt5.QtCore import Qt, QTimer
 from bleak import BleakClient, BleakError
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 import matplotlib.pyplot as plt
+import pandas as pd
+from scipy.optimize import curve_fit
 import csv
 
 GRAPH_INTERVAL = 1000           # ms between redraws
@@ -18,7 +20,7 @@ PID_SETTINGS_FILE = "pid_settings.json"
 def exporter(time_s, core_temp, amb_temp, set_temp, state, PID_gains, file_name):
     with open(str(file_name), 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(["Time (min)", *time_s/60])
+        writer.writerow(["Time (s)", *time_s])
         writer.writerow(["Core Temp (°C)", *core_temp])
         writer.writerow(["Water Temp (°C)", *amb_temp])
         writer.writerow(["Set Temp (°C)", set_temp])
@@ -150,60 +152,76 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Sous‑Vide Control GUI")
-        self.resize(880,480)
+        self.resize(880, 500)
 
-        # ---------- widgets ----------
-        self.btn_probe   = QPushButton("Connect Probe")
-        self.btn_cooker  = QPushButton("Connect Cooker")
-        self.lbl_probe   = QLabel("Probe: ⬤ Disconnected")
-        self.lbl_cooker  = QLabel("Cooker: ⬤ Disconnected")
+        self.tabs = QTabWidget()
+        self.control_tab = QWidget()
+        self.tuning_tab = QWidget()
 
-        self.modeBox     = QComboBox()
+        self.tabs.addTab(self.control_tab, "Control")
+        self.tabs.addTab(self.tuning_tab, "PID Tuning")
+
+        self.setup_control_tab()
+        self.setup_tuning_tab()
+        self.setCentralWidget(self.tabs)
+
+
+
+    def setup_control_tab(self):
+        self.btn_probe = QPushButton("Connect Probe")
+        self.btn_cooker = QPushButton("Connect Cooker")
+        self.lbl_probe = QLabel("Probe: ⬤ Disconnected")
+        self.lbl_cooker = QLabel("Cooker: ⬤ Disconnected")
+
+        self.modeBox = QComboBox()
         self.modeBox.addItems(["Manual", "Normal", "PID Auto"])
         self.modeBox.currentTextChanged.connect(self.mode_changed)
 
-        self.sp_set      = QSpinBox(); self.sp_set.setRange(20, 95); self.sp_set.setValue(55)
-        self.kpBox       = QDoubleSpinBox(); self.kpBox.setRange(0,100); self.kpBox.setValue(1.0)
-        self.kiBox       = QDoubleSpinBox(); self.kiBox.setRange(0,100); self.kiBox.setValue(0.0)
-        self.kdBox       = QDoubleSpinBox(); self.kdBox.setRange(0,2000); self.kdBox.setValue(0.0)
+        self.sp_set = QSpinBox();
+        self.sp_set.setRange(20, 95);
+        self.sp_set.setValue(55)
+        self.kpBox = QDoubleSpinBox();
+        self.kpBox.setRange(0, 100);
+        self.kpBox.setValue(1.0)
+        self.kiBox = QDoubleSpinBox();
+        self.kiBox.setRange(0, 100);
+        self.kiBox.setValue(0.0)
+        self.kdBox = QDoubleSpinBox();
+        self.kdBox.setRange(0, 2000);
+        self.kdBox.setValue(0.0)
 
-        self.lbl_core    = QLabel("Core: --.- °C")
-        self.lbl_water   = QLabel("Water: --.- °C")
-        self.btn_start   = QPushButton("Start")
-        self.btn_stop    = QPushButton("Stop")
-        self.btn_heat    = QPushButton("Heat")
-        self.btn_cool    = QPushButton("Cool")
-        self.btn_dwell   = QPushButton("Dwell")
+        self.lbl_core = QLabel("Core: --.- °C")
+        self.lbl_water = QLabel("Water: --.- °C")
+        self.btn_start = QPushButton("Start")
+        self.btn_stop = QPushButton("Stop")
+        self.btn_heat = QPushButton("Heat")
+        self.btn_cool = QPushButton("Cool")
+        self.btn_dwell = QPushButton("Dwell")
         self.btn_standby = QPushButton("Standby")
-        self.btn_export  = QPushButton("Export Data")
+        self.btn_export = QPushButton("Export Data")
 
-        self.graph       = MatplotCanvas(self)
+        self.graph = MatplotCanvas(self)
 
-        # ---------- layout ----------
         g = QGridLayout()
-        g.addWidget(self.btn_probe, 0,0);  g.addWidget(self.lbl_probe, 0,1)
-        g.addWidget(self.btn_cooker,1,0);  g.addWidget(self.lbl_cooker,1,1)
-        g.addWidget(QLabel("Mode:"),       2,0); g.addWidget(self.modeBox,2,1)
-        g.addWidget(QLabel("Set‑point °C"),3,0); g.addWidget(self.sp_set,3,1)
-        g.addWidget(QLabel("Kp"),4,0); g.addWidget(self.kpBox,4,1)
-        g.addWidget(QLabel("Ki"),5,0); g.addWidget(self.kiBox,5,1)
-        g.addWidget(QLabel("Kd"),6,0); g.addWidget(self.kdBox,6,1)
-        g.addWidget(self.lbl_core,7,0,1,2);  g.addWidget(self.lbl_water,8,0,1,2)
-        g.addWidget(self.btn_start,9,0);     g.addWidget(self.btn_stop,9,1)
-        g.addWidget(self.btn_heat,10,0);     g.addWidget(self.btn_cool,10,1)
-        g.addWidget(self.btn_dwell,11,0);    g.addWidget(self.btn_standby,11,1)
-        g.addWidget(self.btn_export,12,0,1,2)
-        g.addWidget(self.graph,0,2,13,1)
-
-        central = QWidget()
-        central.setLayout(g)
-        self.setCentralWidget(central)
+        g.addWidget(self.btn_probe, 0, 0);        g.addWidget(self.lbl_probe, 0, 1)
+        g.addWidget(self.btn_cooker, 1, 0);        g.addWidget(self.lbl_cooker, 1, 1)
+        g.addWidget(QLabel("Mode:"), 2, 0);        g.addWidget(self.modeBox, 2, 1)
+        g.addWidget(QLabel("Set‑point °C"), 3, 0);        g.addWidget(self.sp_set, 3, 1)
+        g.addWidget(QLabel("Kp"), 4, 0);        g.addWidget(self.kpBox, 4, 1)
+        g.addWidget(QLabel("Ki"), 5, 0);        g.addWidget(self.kiBox, 5, 1)
+        g.addWidget(QLabel("Kd"), 6, 0);        g.addWidget(self.kdBox, 6, 1)
+        g.addWidget(self.lbl_core, 7, 0, 1, 2);        g.addWidget(self.lbl_water, 8, 0, 1, 2)
+        g.addWidget(self.btn_start, 9, 0);        g.addWidget(self.btn_stop, 9, 1)
+        g.addWidget(self.btn_heat, 10, 0);        g.addWidget(self.btn_cool, 10, 1)
+        g.addWidget(self.btn_dwell, 11, 0);        g.addWidget(self.btn_standby, 11, 1)
+        g.addWidget(self.btn_export, 12, 0, 1, 2)
+        g.addWidget(self.graph, 0, 2, 13, 1)
 
         # ---------- state ----------
-        self.thermo  = thermoprobe(PROBE_MAC)
-        self.cooker  = cooker(COOKER_MAC)
+        self.thermo = thermoprobe(PROBE_MAC)
+        self.cooker = cooker(COOKER_MAC)
         self.task_loop = None
-        self.t, self.core, self.water = [],[],[]
+        self.t, self.core, self.water = [], [], []
         self.running = False
 
         # Load PID gains from file if available
@@ -224,7 +242,71 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.redraw)
         self.timer.start(GRAPH_INTERVAL)
-        self.mode_changed("Manual")
+        self.mode_changed("Manual")  # Replace with your existing layout
+
+        container = QWidget()
+        container.setLayout(g)
+        self.control_tab.setLayout(QVBoxLayout())
+        self.control_tab.layout().addWidget(container)
+
+    def setup_tuning_tab(self):
+        layout = QVBoxLayout()
+        self.load_csv_btn = QPushButton("Load Step Response CSV")
+        self.result_label = QLabel("PID parameters will appear here.")
+        self.plot_canvas = MatplotCanvas(self)
+
+        self.load_csv_btn.clicked.connect(self.load_and_fit_csv)
+
+        layout.addWidget(self.load_csv_btn)
+        layout.addWidget(self.result_label)
+        layout.addWidget(self.plot_canvas)
+        self.tuning_tab.setLayout(layout)
+
+    def load_and_fit_csv(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV Files (*.csv)")
+        if not file_path:
+            return
+
+        try:
+            df = pd.read_csv(file_path, index_col=False)
+            t = np.array([float(x) for x in df.iloc[0, 1:].dropna()])
+            core_temp = np.array([float(x) for x in df.iloc[1, 1:].dropna()])
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load CSV: {e}")
+            return
+
+        def foptd(t, K, tau, L):
+            T0 = core_temp[0]
+            T = np.piecewise(
+                t, [t < L, t >= L],
+                [lambda t: T0,
+                 lambda t: T0 + K * (1 - np.exp(-(t - L) / tau))]
+            )
+            return T
+
+        try:
+            params, _ = curve_fit(foptd, t, core_temp, p0=[30, 300, 20])
+            K, tau, L = params
+            Kp = 1.2 * tau / (K * L)
+            Ti = 2 * L
+            Td = 0.5 * L
+            Ki = Kp / Ti
+            Kd = Kp * Td
+
+            self.result_label.setText(
+                f"FOPTD Fit (Core Temp): K={K:.2f}, tau={tau:.2f}, L={L:.2f}\n"
+                f"Ziegler-Nichols PID: Kp={Kp:.3f}, Ki={Ki:.5f}, Kd={Kd:.3f}"
+            )
+
+            self.plot_canvas.ax.clear()
+            self.plot_canvas.ax.plot(t, core_temp, label="Measured Core Temp")
+            self.plot_canvas.ax.plot(t, foptd(t, *params), '--', label="FOPTD Fit")
+            self.plot_canvas.ax.set_xlabel("Time [s]")
+            self.plot_canvas.ax.set_ylabel("Core Temperature [°C]")
+            self.plot_canvas.ax.legend()
+            self.plot_canvas.draw_idle()
+        except Exception as e:
+            QMessageBox.critical(self, "Fitting Error", f"Could not fit model: {e}")
 
     def mode_changed(self, text):
         is_manual = (text == "Manual")
