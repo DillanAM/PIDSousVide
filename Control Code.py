@@ -18,7 +18,7 @@ PID_SETTINGS_FILE = "pid_settings.json"
 def exporter(time_s, core_temp, amb_temp, set_temp, state, PID_gains, file_name):
     with open(str(file_name), 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(["Time (s)", *time_s])
+        writer.writerow(["Time (min)", *time_s/60])
         writer.writerow(["Core Temp (°C)", *core_temp])
         writer.writerow(["Water Temp (°C)", *amb_temp])
         writer.writerow(["Set Temp (°C)", set_temp])
@@ -68,6 +68,14 @@ class thermoprobe:
             await self.BLE_Object.disconnect()
 
     async def temperature_read(self):
+        while not await self.connection_status():
+            print("Lost connection to probe. Reconnecting...")
+            try:
+                await self.connect_routine()
+            except Exception as e:
+                print(f"Reconnection attempt failed: {e}")
+                await asyncio.sleep(2)
+
         probe_read = await self.BLE_Object.read_gatt_char(self.UUID)
         virtual_sensor_byte = int.from_bytes(probe_read[22:23], byteorder='little')
         virtual_sensor_bits = f'{virtual_sensor_byte:08b}'
@@ -122,7 +130,7 @@ class MatplotCanvas(FigureCanvasQTAgg):
         self.fig, self.ax = plt.subplots(figsize=(6,3), tight_layout=True)
         super().__init__(self.fig)
         self.setParent(parent)
-        self.ax.set_xlabel("Time [s]")
+        self.ax.set_xlabel("Time [min]")
         self.ax.set_ylabel("T [°C]")
         self.lines = {
             "core":  self.ax.plot([], [], 'r-', label="Core")[0],
@@ -133,7 +141,7 @@ class MatplotCanvas(FigureCanvasQTAgg):
 
     def plot_data(self, t, core, water, setpoint):
         for k, y in [("core",core),("water",water),("set",np.full_like(core,setpoint))]:
-            self.lines[k].set_data(t, y)
+            self.lines[k].set_data(t/60, y)
         self.ax.relim()
         self.ax.autoscale_view()
         self.draw_idle()
@@ -219,11 +227,13 @@ class MainWindow(QMainWindow):
         self.mode_changed("Manual")
 
     def mode_changed(self, text):
-        enabled = (text == "Manual")
-        self.btn_heat.setEnabled(enabled)
-        self.btn_cool.setEnabled(enabled)
-        self.btn_dwell.setEnabled(enabled)
-        self.btn_standby.setEnabled(enabled)
+        is_manual = (text == "Manual")
+        self.btn_heat.setEnabled(is_manual)
+        self.btn_cool.setEnabled(is_manual)
+        self.btn_dwell.setEnabled(is_manual)
+        self.btn_standby.setEnabled(is_manual)
+        self.btn_start.setEnabled(not is_manual)
+        self.btn_stop.setEnabled(not is_manual)
 
     def load_pid_settings(self):
         if os.path.exists(PID_SETTINGS_FILE):
