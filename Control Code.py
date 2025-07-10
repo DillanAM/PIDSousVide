@@ -163,9 +163,23 @@ class MainWindow(QMainWindow):
 
         self.setup_control_tab()
         self.setup_tuning_tab()
+
         self.setCentralWidget(self.tabs)
 
+        # ---------- state ----------
+        self.thermo = thermoprobe(PROBE_MAC)
+        self.cooker = cooker(COOKER_MAC)
+        self.task_loop = None
+        self.t, self.core, self.water = [], [], []
+        self.running = False
+        self.pid_heating = None
+        self.pid_cooling = None
 
+        self.last_time = time.time()
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.redraw)
+        self.timer.start(GRAPH_INTERVAL)
 
     def setup_control_tab(self):
         self.btn_probe = QPushButton("Connect Probe")
@@ -180,15 +194,26 @@ class MainWindow(QMainWindow):
         self.sp_set = QSpinBox();
         self.sp_set.setRange(20, 95);
         self.sp_set.setValue(55)
-        self.kpBox = QDoubleSpinBox();
-        self.kpBox.setRange(0, 100);
-        self.kpBox.setValue(1.0)
-        self.kiBox = QDoubleSpinBox();
-        self.kiBox.setRange(0, 100);
-        self.kiBox.setValue(0.0)
-        self.kdBox = QDoubleSpinBox();
-        self.kdBox.setRange(0, 2000);
-        self.kdBox.setValue(0.0)
+
+        self.kpHeatBox = QDoubleSpinBox();
+        self.kpHeatBox.setRange(0, 100);
+        self.kpHeatBox.setValue(1.0)
+        self.kiHeatBox = QDoubleSpinBox();
+        self.kiHeatBox.setRange(0, 100);
+        self.kiHeatBox.setValue(0.0)
+        self.kdHeatBox = QDoubleSpinBox();
+        self.kdHeatBox.setRange(0, 2000);
+        self.kdHeatBox.setValue(0.0)
+
+        self.kpCoolBox = QDoubleSpinBox();
+        self.kpCoolBox.setRange(0, 100);
+        self.kpCoolBox.setValue(1.0)
+        self.kiCoolBox = QDoubleSpinBox();
+        self.kiCoolBox.setRange(0, 100);
+        self.kiCoolBox.setValue(0.0)
+        self.kdCoolBox = QDoubleSpinBox();
+        self.kdCoolBox.setRange(0, 2000);
+        self.kdCoolBox.setValue(0.0)
 
         self.lbl_core = QLabel("Core: --.- °C")
         self.lbl_water = QLabel("Water: --.- °C")
@@ -203,26 +228,43 @@ class MainWindow(QMainWindow):
         self.graph = MatplotCanvas(self)
 
         g = QGridLayout()
-        g.addWidget(self.btn_probe, 0, 0);        g.addWidget(self.lbl_probe, 0, 1)
-        g.addWidget(self.btn_cooker, 1, 0);        g.addWidget(self.lbl_cooker, 1, 1)
-        g.addWidget(QLabel("Mode:"), 2, 0);        g.addWidget(self.modeBox, 2, 1)
-        g.addWidget(QLabel("Set‑point °C"), 3, 0);        g.addWidget(self.sp_set, 3, 1)
-        g.addWidget(QLabel("Kp"), 4, 0);        g.addWidget(self.kpBox, 4, 1)
-        g.addWidget(QLabel("Ki"), 5, 0);        g.addWidget(self.kiBox, 5, 1)
-        g.addWidget(QLabel("Kd"), 6, 0);        g.addWidget(self.kdBox, 6, 1)
-        g.addWidget(self.lbl_core, 7, 0, 1, 2);        g.addWidget(self.lbl_water, 8, 0, 1, 2)
-        g.addWidget(self.btn_start, 9, 0);        g.addWidget(self.btn_stop, 9, 1)
-        g.addWidget(self.btn_heat, 10, 0);        g.addWidget(self.btn_cool, 10, 1)
-        g.addWidget(self.btn_dwell, 11, 0);        g.addWidget(self.btn_standby, 11, 1)
-        g.addWidget(self.btn_export, 12, 0, 1, 2)
-        g.addWidget(self.graph, 0, 2, 13, 1)
+        g.addWidget(self.btn_probe, 0, 0);
+        g.addWidget(self.lbl_probe, 0, 1)
+        g.addWidget(self.btn_cooker, 1, 0);
+        g.addWidget(self.lbl_cooker, 1, 1)
+        g.addWidget(QLabel("Mode:"), 2, 0);
+        g.addWidget(self.modeBox, 2, 1)
+        g.addWidget(QLabel("Set‑point °C"), 3, 0);
+        g.addWidget(self.sp_set, 3, 1)
 
-        # ---------- state ----------
-        self.thermo = thermoprobe(PROBE_MAC)
-        self.cooker = cooker(COOKER_MAC)
-        self.task_loop = None
-        self.t, self.core, self.water = [], [], []
-        self.running = False
+        g.addWidget(QLabel("Heating PID"), 4, 0, 1, 2)
+        g.addWidget(QLabel("Kp"), 5, 0);
+        g.addWidget(self.kpHeatBox, 5, 1)
+        g.addWidget(QLabel("Ki"), 6, 0);
+        g.addWidget(self.kiHeatBox, 6, 1)
+        g.addWidget(QLabel("Kd"), 7, 0);
+        g.addWidget(self.kdHeatBox, 7, 1)
+
+        g.addWidget(QLabel("Cooling PID"), 8, 0, 1, 2)
+        g.addWidget(QLabel("Kp"), 9, 0);
+        g.addWidget(self.kpCoolBox, 9, 1)
+        g.addWidget(QLabel("Ki"), 10, 0);
+        g.addWidget(self.kiCoolBox, 10, 1)
+        g.addWidget(QLabel("Kd"), 11, 0);
+        g.addWidget(self.kdCoolBox, 11, 1)
+
+        g.addWidget(self.lbl_core, 12, 0, 1, 2);
+        g.addWidget(self.lbl_water, 13, 0, 1, 2)
+        g.addWidget(self.btn_start, 14, 0);
+        g.addWidget(self.btn_stop, 14, 1)
+        g.addWidget(self.btn_heat, 15, 0);
+        g.addWidget(self.btn_cool, 15, 1)
+        g.addWidget(self.btn_dwell, 16, 0);
+        g.addWidget(self.btn_standby, 16, 1)
+        g.addWidget(self.btn_export, 17, 0, 1, 2)
+        g.addWidget(self.graph, 0, 2, 18, 1)
+
+
 
         # Load PID gains from file if available
         self.load_pid_settings()
@@ -236,33 +278,34 @@ class MainWindow(QMainWindow):
         self.btn_cool.clicked.connect(lambda: asyncio.create_task(self.cooker.cool()))
         self.btn_dwell.clicked.connect(lambda: asyncio.create_task(self.cooker.dwell()))
         self.btn_standby.clicked.connect(lambda: asyncio.create_task(self.cooker.standby()))
-        self.btn_export.clicked.connect(self.export_data)
-
-        # auto-refresh graph timer
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.redraw)
-        self.timer.start(GRAPH_INTERVAL)
-        self.mode_changed("Manual")  # Replace with your existing layout
+        self.btn_export.clicked.connect(lambda: self.export_data())
 
         container = QWidget()
         container.setLayout(g)
         self.control_tab.setLayout(QVBoxLayout())
         self.control_tab.layout().addWidget(container)
 
+        self.mode_changed(self.modeBox.currentText())
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(False)
+
     def setup_tuning_tab(self):
         layout = QVBoxLayout()
-        self.load_csv_btn = QPushButton("Load Step Response CSV")
+        self.load_heat_csv_btn = QPushButton("Load Heating Step Response")
+        self.load_cool_csv_btn = QPushButton("Load Cooling Step Response")
         self.result_label = QLabel("PID parameters will appear here.")
         self.plot_canvas = MatplotCanvas(self)
 
-        self.load_csv_btn.clicked.connect(self.load_and_fit_csv)
+        self.load_heat_csv_btn.clicked.connect(lambda: self.load_and_fit_csv('heat'))
+        self.load_cool_csv_btn.clicked.connect(lambda: self.load_and_fit_csv('cool'))
 
-        layout.addWidget(self.load_csv_btn)
+        layout.addWidget(self.load_heat_csv_btn)
+        layout.addWidget(self.load_cool_csv_btn)
         layout.addWidget(self.result_label)
         layout.addWidget(self.plot_canvas)
         self.tuning_tab.setLayout(layout)
 
-    def load_and_fit_csv(self):
+    def load_and_fit_csv(self, mode):
         file_path, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV Files (*.csv)")
         if not file_path:
             return
@@ -270,13 +313,13 @@ class MainWindow(QMainWindow):
         try:
             df = pd.read_csv(file_path, index_col=False)
             t = np.array([float(x) for x in df.iloc[0, 1:].dropna()])
-            core_temp = np.array([float(x) for x in df.iloc[1, 1:].dropna()])
+            temp = np.array([float(x) for x in df.iloc[1, 1:].dropna()])
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load CSV: {e}")
             return
 
         def foptd(t, K, tau, L):
-            T0 = core_temp[0]
+            T0 = temp[0]
             T = np.piecewise(
                 t, [t < L, t >= L],
                 [lambda t: T0,
@@ -285,7 +328,7 @@ class MainWindow(QMainWindow):
             return T
 
         try:
-            params, _ = curve_fit(foptd, t, core_temp, p0=[30, 300, 20])
+            params, _ = curve_fit(foptd, t, temp, p0=[30, 300, 20])
             K, tau, L = params
             Kp = 1.2 * tau / (K * L)
             Ti = 2 * L
@@ -294,45 +337,53 @@ class MainWindow(QMainWindow):
             Kd = Kp * Td
 
             self.result_label.setText(
-                f"FOPTD Fit (Core Temp): K={K:.2f}, tau={tau:.2f}, L={L:.2f}\n"
-                f"Ziegler-Nichols PID: Kp={Kp:.3f}, Ki={Ki:.5f}, Kd={Kd:.3f}"
+                f"FOPTD Fit ({mode}): K={K:.2f}, tau={tau:.2f}, L={L:.2f}\n"
+                f"Ziegler-Nichols PID ({mode}): Kp={Kp:.3f}, Ki={Ki:.5f}, Kd={Kd:.3f}"
             )
 
-            self.plot_canvas.ax.clear()
-            self.plot_canvas.ax.plot(t, core_temp, label="Measured Core Temp")
-            self.plot_canvas.ax.plot(t, foptd(t, *params), '--', label="FOPTD Fit")
-            self.plot_canvas.ax.set_xlabel("Time [s]")
-            self.plot_canvas.ax.set_ylabel("Core Temperature [°C]")
-            self.plot_canvas.ax.legend()
-            self.plot_canvas.draw_idle()
+            self.plot_canvas.plot_curve(t, temp, foptd(t, *params))
         except Exception as e:
             QMessageBox.critical(self, "Fitting Error", f"Could not fit model: {e}")
 
+
     def mode_changed(self, text):
         is_manual = (text == "Manual")
+        is_auto = (text == 'PID Auto')
         self.btn_heat.setEnabled(is_manual)
         self.btn_cool.setEnabled(is_manual)
         self.btn_dwell.setEnabled(is_manual)
         self.btn_standby.setEnabled(is_manual)
         self.btn_start.setEnabled(not is_manual)
         self.btn_stop.setEnabled(not is_manual)
+        self.kpHeatBox.setEnabled(is_auto)
+        self.kiHeatBox.setEnabled(is_auto)
+        self.kdHeatBox.setEnabled(is_auto)
+        self.kpCoolBox.setEnabled(is_auto)
+        self.kiCoolBox.setEnabled(is_auto)
+        self.kdCoolBox.setEnabled(is_auto)
 
     def load_pid_settings(self):
         if os.path.exists(PID_SETTINGS_FILE):
             try:
                 with open(PID_SETTINGS_FILE, 'r') as f:
                     data = json.load(f)
-                    self.kpBox.setValue(data.get('kp', 1.0))
-                    self.kiBox.setValue(data.get('ki', 0.0))
-                    self.kdBox.setValue(data.get('kd', 0.0))
+                    self.kpHeatBox.setValue(data.get('kpHeat', 0.0))
+                    self.kiHeatBox.setValue(data.get('kiHeat', 0.0))
+                    self.kdHeatBox.setValue(data.get('kdHeat', 0.0))
+                    self.kpCoolBox.setValue(data.get('kpCool', 0.0))
+                    self.kiCoolBox.setValue(data.get('kiCool', 0.0))
+                    self.kdCoolBox.setValue(data.get('kdCool', 0.0))
             except Exception as e:
                 print(f"Failed to load PID settings: {e}")
 
     def save_pid_settings(self):
         data = {
-            'kp': self.kpBox.value(),
-            'ki': self.kiBox.value(),
-            'kd': self.kdBox.value()
+            'kpHeat': self.kpHeatBox.value(),
+            'kiHeat': self.kiHeatBox.value(),
+            'kdHeat': self.kdHeatBox.value(),
+            'kpCool': self.kpCoolBox.value(),
+            'kiCool': self.kiCoolBox.value(),
+            'kdCool': self.kdCoolBox.value()
         }
         try:
             with open(PID_SETTINGS_FILE, 'w') as f:
@@ -379,24 +430,37 @@ class MainWindow(QMainWindow):
             self.btn_cooker.setEnabled(True)
 
     async def start_loop(self):
-        if self.task_loop:
+        if self.running:
             QMessageBox.information(self,"Running","Loop already running")
             return
         if not (await self.thermo.connection_status() and await self.cooker.connection_status()):
             QMessageBox.warning(self,"Not connected","Connect probe and cooker first")
             return
 
+        setpoint = self.sp_set.value()
+
         self.t.clear()
         self.core.clear()
         self.water.clear()
 
+        # Initialize PID controllers from control tab spinboxes
+        self.pid_heating = PIDController(
+            self.kpHeatBox.value(),
+            self.kiHeatBox.value(),
+            self.kdHeatBox.value(),
+            setpoint
+        )
+        self.pid_cooling = PIDController(
+            self.kpCoolBox.value(),
+            self.kiCoolBox.value(),
+            self.kdCoolBox.value(),
+            setpoint
+        )
+
         mode = self.modeBox.currentText()
         self.running = True
-        self.t0 = time.time()
-        self.pid = PIDController(self.kpBox.value(), self.kiBox.value(),
-                                 self.kdBox.value(), self.sp_set.value())
-
-        self.task_loop = asyncio.create_task(self.loop(mode))
+        self.last_time = time.time()
+        self.task_loop = asyncio.create_task(self.control_loop(mode))
 
     async def stop_loop(self):
         self.running = False
@@ -405,42 +469,51 @@ class MainWindow(QMainWindow):
             self.task_loop = None
         await self.cooker.standby()
 
-    async def loop(self, mode):
+    async def control_loop(self, mode):
         try:
-            last = time.time()
+            now = time.time()
+            dt = now - self.last_time
+            self.last_time = now
+
             while self.running:
                 try:
-                    core,surf,water = await self.thermo.temperature_read()
-                except Exception as e:
-                    self.statusBar().showMessage(f"Probe read error: {e}")
-                    await asyncio.sleep(2)
-                    continue
-                now = time.time()
-                self.t.append(now - self.t0)
-                self.core.append(core)
-                self.water.append(water)
-                self.lbl_core.setText(f"Core: {core:.1f} °C")
-                self.lbl_water.setText(f"Water: {water:.1f} °C")
-                self.redraw()
-                if mode == "Manual":
-                    pass
-                else:
-                    dt = now - last
-                    last = now
-                    out = self.pid.calculate(water if mode == "Normal" else core, dt)
+                    core, _, water = await self.thermo.temperature_read()
+                    self.lbl_core.setText(f"Core: {core:.1f} °C")
+                    self.lbl_water.setText(f"Water: {water:.1f} °C")
+
+                    setpoint = self.sp_set.value()
+
+                    if mode == "Manual":
+                        return
+
                     if mode == "Normal":
-                        if out > 0.5:
+                        error = setpoint - water
+                        if error > 0:
                             await self.cooker.heat()
                         else:
                             await self.cooker.dwell()
+
                     elif mode == "PID Auto":
-                        if out > 5:
+                        error = setpoint - core
+                        band = 2.0  # °C transition band
+                        alpha = np.clip(0.5 + 0.5 * (error / band), 0.0, 1.0)
+
+                        heating_output = self.pid_heating.calculate(core, dt) if self.pid_heating else 0
+                        cooling_output = self.pid_cooling.calculate(core, dt) if self.pid_cooling else 0
+
+                        output = alpha * heating_output + (1 - alpha) * cooling_output
+
+                        print(f"[CONTROL] PID Auto, Error: {error:.2f}, Alpha: {alpha:.2f}, Output: {output:.2f}")
+
+                        if output > 5:
                             await self.cooker.heat()
-                        elif out < -5:
+                        elif output < -5:
                             await self.cooker.cool()
                         else:
                             await self.cooker.dwell()
-                await asyncio.sleep(CONTROL_INTERVAL)
+
+                except Exception as e:
+                    print(f"[ERROR] Control loop exception: {e}")
         finally:
             await self.cooker.standby()
 
