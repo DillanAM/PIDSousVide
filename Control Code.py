@@ -17,7 +17,7 @@ COOKER_MAC = "94:A9:A8:19:77:5F"
 PROBE_MAC = "C2:71:1E:F2:C6:20"
 PID_SETTINGS_FILE = "pid_settings.json"
 
-def exporter(time_s, core_temp, amb_temp, set_temp, state, PID_gains, file_name):
+def exporter(time_s, core_temp, amb_temp, set_temp, state, file_name):
     with open(str(file_name), 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(["Time (s)", *time_s])
@@ -25,7 +25,6 @@ def exporter(time_s, core_temp, amb_temp, set_temp, state, PID_gains, file_name)
         writer.writerow(["Water Temp (°C)", *amb_temp])
         writer.writerow(["Set Temp (°C)", set_temp])
         writer.writerow(["State", *state])
-        writer.writerow(["PID Gains", *PID_gains])
 
 class PIDController:
     def __init__(self, kp, ki, kd, target_temperature):
@@ -179,7 +178,7 @@ class MainWindow(QMainWindow):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.redraw)
-        self.timer.start(GRAPH_INTERVAL)
+        self.timer.start(CONTROL_INTERVAL*1000)
 
     def setup_control_tab(self):
         self.btn_probe = QPushButton("Connect Probe")
@@ -460,6 +459,7 @@ class MainWindow(QMainWindow):
         mode = self.modeBox.currentText()
         self.running = True
         self.last_time = time.time()
+        self.t0 = time.time()
         self.task_loop = asyncio.create_task(self.control_loop(mode))
 
     async def stop_loop(self):
@@ -471,17 +471,20 @@ class MainWindow(QMainWindow):
 
     async def control_loop(self, mode):
         try:
-            now = time.time()
-            dt = now - self.last_time
-            self.last_time = now
-
+            t0 = time.time()
             while self.running:
+                now = time.time()
+                dt = now - self.last_time
+                self.last_time = now
                 try:
                     core, _, water = await self.thermo.temperature_read()
                     self.lbl_core.setText(f"Core: {core:.1f} °C")
                     self.lbl_water.setText(f"Water: {water:.1f} °C")
+                    self.t.append(now - t0)
+                    self.core.append(core); self.water.append(water)
 
                     setpoint = self.sp_set.value()
+                    self.redraw()
 
                     if mode == "Manual":
                         return
@@ -490,6 +493,8 @@ class MainWindow(QMainWindow):
                         error = setpoint - water
                         if error > 0:
                             await self.cooker.heat()
+                        elif error < -2:
+                            await self.cooker.cool()
                         else:
                             await self.cooker.dwell()
 
@@ -512,6 +517,7 @@ class MainWindow(QMainWindow):
                         else:
                             await self.cooker.dwell()
 
+
                 except Exception as e:
                     print(f"[ERROR] Control loop exception: {e}")
         finally:
@@ -531,8 +537,7 @@ class MainWindow(QMainWindow):
 
         filename, _ = QFileDialog.getSaveFileName(self, "Save CSV", "sous_vide_data.csv", "CSV Files (*.csv)")
         if filename:
-            pid_values = [self.kpBox.value(), self.kiBox.value(), self.kdBox.value()]
-            exporter(self.t, self.core, self.water, self.sp_set.value(), ["running"]*len(self.t), pid_values, filename)
+            exporter(self.t, self.core, self.water, self.sp_set.value(), ["running"]*len(self.t), filename)
 
     def closeEvent(self, event):
         # Save PID settings on exit
