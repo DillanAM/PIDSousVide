@@ -137,11 +137,19 @@ class MatplotCanvas(FigureCanvasQTAgg):
             "core":  self.ax.plot([], [], 'r-', label="Core")[0],
             "water": self.ax.plot([], [], 'b-', label="Water")[0],
             "set":   self.ax.plot([], [], 'k--',label="Set‑point")[0],
+            "foptd": self.ax.plot([], [], 'g--',label="FOPTD Fit")[0]
         }
         self.ax.legend()
 
     def plot_data(self, t, core, water, setpoint):
         for k, y in [("core",core),("water",water),("set",np.full_like(core,setpoint))]:
+            self.lines[k].set_data(t/60, y)
+        self.ax.relim()
+        self.ax.autoscale_view()
+        self.draw_idle()
+
+    def fit_plot(self, t, core, water, setpoint, foptd, *params):
+        for k, y in [("core", core), ("water", water), ("set", np.full_like(core, setpoint)), ("foptd", foptd(t, *params))]:
             self.lines[k].set_data(t/60, y)
         self.ax.relim()
         self.ax.autoscale_view()
@@ -190,29 +198,15 @@ class MainWindow(QMainWindow):
         self.modeBox.addItems(["Manual", "Normal", "PID Auto"])
         self.modeBox.currentTextChanged.connect(self.mode_changed)
 
-        self.sp_set = QSpinBox();
-        self.sp_set.setRange(20, 95);
-        self.sp_set.setValue(55)
+        self.sp_set = QSpinBox(); self.sp_set.setRange(20, 95); self.sp_set.setValue(55)
 
-        self.kpHeatBox = QDoubleSpinBox();
-        self.kpHeatBox.setRange(0, 100);
-        self.kpHeatBox.setValue(1.0)
-        self.kiHeatBox = QDoubleSpinBox();
-        self.kiHeatBox.setRange(0, 100);
-        self.kiHeatBox.setValue(0.0)
-        self.kdHeatBox = QDoubleSpinBox();
-        self.kdHeatBox.setRange(0, 2000);
-        self.kdHeatBox.setValue(0.0)
+        self.kpHeatBox = QDoubleSpinBox(); self.kpHeatBox.setRange(0, 100); self.kpHeatBox.setValue(1.0); self.kpHeatBox.setDecimals(5)
+        self.kiHeatBox = QDoubleSpinBox(); self.kiHeatBox.setRange(0, 100); self.kiHeatBox.setValue(0.0); self.kiHeatBox.setDecimals(5)
+        self.kdHeatBox = QDoubleSpinBox(); self.kdHeatBox.setRange(0, 2000); self.kdHeatBox.setValue(0.0); self.kdHeatBox.setDecimals(5)
 
-        self.kpCoolBox = QDoubleSpinBox();
-        self.kpCoolBox.setRange(0, 100);
-        self.kpCoolBox.setValue(1.0)
-        self.kiCoolBox = QDoubleSpinBox();
-        self.kiCoolBox.setRange(0, 100);
-        self.kiCoolBox.setValue(0.0)
-        self.kdCoolBox = QDoubleSpinBox();
-        self.kdCoolBox.setRange(0, 2000);
-        self.kdCoolBox.setValue(0.0)
+        self.kpCoolBox = QDoubleSpinBox(); self.kpCoolBox.setRange(0, 100); self.kpCoolBox.setValue(1.0); self.kpCoolBox.setDecimals(5)
+        self.kiCoolBox = QDoubleSpinBox(); self.kiCoolBox.setRange(0, 100); self.kiCoolBox.setValue(0.0); self.kiCoolBox.setDecimals(5)
+        self.kdCoolBox = QDoubleSpinBox(); self.kdCoolBox.setRange(0, 2000); self.kdCoolBox.setValue(0.0); self.kdCoolBox.setDecimals(5)
 
         self.lbl_core = QLabel("Core: --.- °C")
         self.lbl_water = QLabel("Water: --.- °C")
@@ -310,15 +304,17 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            df = pd.read_csv(file_path, index_col=False)
+            df = pd.read_csv(file_path, index_col=False, header=None)
             t = np.array([float(x) for x in df.iloc[0, 1:].dropna()])
-            temp = np.array([float(x) for x in df.iloc[1, 1:].dropna()])
+            core = np.array([float(x) for x in df.iloc[1, 1:].dropna()])
+            water = np.array([float(x) for x in df.iloc[2, 1:].dropna()])
+            set_point = float(df.iloc[3, 1])
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load CSV: {e}")
             return
 
         def foptd(t, K, tau, L):
-            T0 = temp[0]
+            T0 = core[0]
             T = np.piecewise(
                 t, [t < L, t >= L],
                 [lambda t: T0,
@@ -327,20 +323,29 @@ class MainWindow(QMainWindow):
             return T
 
         try:
-            params, _ = curve_fit(foptd, t, temp, p0=[30, 300, 20])
-            K, tau, L = params
+            params, _ = curve_fit(foptd, t, core, p0=[30, 300, 20])
+            K, tau, L = abs(params)
             Kp = 1.2 * tau / (K * L)
             Ti = 2 * L
             Td = 0.5 * L
             Ki = Kp / Ti
             Kd = Kp * Td
 
+            if mode == 'heat':
+                self.kpHeatBox.setValue(Kp)
+                self.kiHeatBox.setValue(Ki)
+                self.kdHeatBox.setValue(Kd)
+            elif mode == 'cool':
+                self.kpCoolBox.setValue(Kp)
+                self.kiCoolBox.setValue(Ki)
+                self.kdCoolBox.setValue(Kd)
+
             self.result_label.setText(
                 f"FOPTD Fit ({mode}): K={K:.2f}, tau={tau:.2f}, L={L:.2f}\n"
                 f"Ziegler-Nichols PID ({mode}): Kp={Kp:.3f}, Ki={Ki:.5f}, Kd={Kd:.3f}"
             )
 
-            self.plot_canvas.plot_curve(t, temp, foptd(t, *params))
+            self.plot_canvas.fit_plot(t, core, water, set_point, foptd, *params)
         except Exception as e:
             QMessageBox.critical(self, "Fitting Error", f"Could not fit model: {e}")
 
