@@ -1,1 +1,2 @@
-{"kpHeat": 0.13135, "kiHeat": 0.00019, "kdHeat": 22.15392, "kpCool": 0.46992, "kiCool": 0.00126, "kdCool": 43.85937}
+{"kpCoreSurf": 0.0, "kiCoreSurf": 0.0, "kdCoreSurf": 0.0, "kpSurfWater": 0.0, "kiSurfWater": 0.0, "kdSurfWater": 0.0, "kpWater": 0.0, "kiWater": 0.0, "kdWater": 0.0}
+
