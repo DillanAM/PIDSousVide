@@ -304,7 +304,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            df = pd.read_csv(file_path, index_col=False, header=None)
+            df = pd.read_csv(file_path, index_col=False, encoding='cp1252', header=None)
             t = np.array([float(x) for x in df.iloc[0, 1:].dropna()])
             core = np.array([float(x) for x in df.iloc[1, 1:].dropna()])
             water = np.array([float(x) for x in df.iloc[2, 1:].dropna()])
@@ -515,9 +515,9 @@ class MainWindow(QMainWindow):
 
                         print(f"[CONTROL] PID Auto, Error: {error:.2f}, Alpha: {alpha:.2f}, Output: {output:.2f}")
 
-                        if output > 5:
+                        if output > 1:
                             await self.cooker.heat()
-                        elif output < -5:
+                        elif output < -1:
                             await self.cooker.cool()
                         else:
                             await self.cooker.dwell()
