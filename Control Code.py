@@ -17,12 +17,14 @@ COOKER_MAC = "94:A9:A8:19:77:5F"
 PROBE_MAC = "C2:71:1E:F2:C6:20"
 PID_SETTINGS_FILE = "pid_settings.json"
 
-def exporter(time_s, core_temp, amb_temp, set_temp, state, file_name):
+def exporter(time_s, core_temp, surface_temp, water_temp, set_temp, state, file_name):
+    """Export step response data to CSV including surface temperatures."""
     with open(str(file_name), 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(["Time (s)", *time_s])
         writer.writerow(["Core Temp (°C)", *core_temp])
-        writer.writerow(["Water Temp (°C)", *amb_temp])
+        writer.writerow(["Surface Temp (°C)", *surface_temp])
+        writer.writerow(["Water Temp (°C)", *water_temp])
         writer.writerow(["Set Temp (°C)", set_temp])
         writer.writerow(["State", *state])
 
@@ -134,23 +136,37 @@ class MatplotCanvas(FigureCanvasQTAgg):
         self.ax.set_xlabel("Time [min]")
         self.ax.set_ylabel("T [°C]")
         self.lines = {
-            "core":  self.ax.plot([], [], 'r-', label="Core")[0],
-            "water": self.ax.plot([], [], 'b-', label="Water")[0],
-            "set":   self.ax.plot([], [], 'k--',label="Set‑point")[0],
-            "foptd": self.ax.plot([], [], 'g--',label="FOPTD Fit")[0]
+            "core":    self.ax.plot([], [], 'r-', label="Core")[0],
+            "surface": self.ax.plot([], [], 'm-', label="Surface")[0],
+            "water":   self.ax.plot([], [], 'b-', label="Water")[0],
+            "set":     self.ax.plot([], [], 'k--', label="Set‑point")[0],
+            "foptd":   self.ax.plot([], [], 'g--', label="FOPTD Fit")[0],
         }
         self.ax.legend()
 
-    def plot_data(self, t, core, water, setpoint):
-        for k, y in [("core",core),("water",water),("set",np.full_like(core,setpoint))]:
-            self.lines[k].set_data(t/60, y)
+    def plot_data(self, t, core, surface, water, setpoint):
+        """Update graph with new measurements."""
+        for k, y in [
+            ("core", core),
+            ("surface", surface),
+            ("water", water),
+            ("set", np.full_like(core, setpoint)),
+        ]:
+            self.lines[k].set_data(t / 60, y)
         self.ax.relim()
         self.ax.autoscale_view()
         self.draw_idle()
 
-    def fit_plot(self, t, core, water, setpoint, foptd, *params):
-        for k, y in [("core", core), ("water", water), ("set", np.full_like(core, setpoint)), ("foptd", foptd(t, *params))]:
-            self.lines[k].set_data(t/60, y)
+    def fit_plot(self, t, core, surface, water, setpoint, foptd, *params):
+        """Plot the FOPTD fit alongside measured data."""
+        for k, y in [
+            ("core", core),
+            ("surface", surface),
+            ("water", water),
+            ("set", np.full_like(core, setpoint)),
+            ("foptd", foptd(t, *params)),
+        ]:
+            self.lines[k].set_data(t / 60, y)
         self.ax.relim()
         self.ax.autoscale_view()
         self.draw_idle()
@@ -177,10 +193,11 @@ class MainWindow(QMainWindow):
         self.thermo = thermoprobe(PROBE_MAC)
         self.cooker = cooker(COOKER_MAC)
         self.task_loop = None
-        self.t, self.core, self.water = [], [], []
+        self.t, self.core, self.surface, self.water = [], [], [], []
         self.running = False
-        self.pid_heating = None
-        self.pid_cooling = None
+        self.pid_core_surface = None
+        self.pid_surface_water = None
+        self.pid_water = None
 
         self.last_time = time.time()
 
@@ -200,13 +217,19 @@ class MainWindow(QMainWindow):
 
         self.sp_set = QSpinBox(); self.sp_set.setRange(20, 95); self.sp_set.setValue(55)
 
-        self.kpHeatBox = QDoubleSpinBox(); self.kpHeatBox.setRange(0, 100); self.kpHeatBox.setValue(1.0); self.kpHeatBox.setDecimals(5)
-        self.kiHeatBox = QDoubleSpinBox(); self.kiHeatBox.setRange(0, 100); self.kiHeatBox.setValue(0.0); self.kiHeatBox.setDecimals(5)
-        self.kdHeatBox = QDoubleSpinBox(); self.kdHeatBox.setRange(0, 2000); self.kdHeatBox.setValue(0.0); self.kdHeatBox.setDecimals(5)
 
-        self.kpCoolBox = QDoubleSpinBox(); self.kpCoolBox.setRange(0, 100); self.kpCoolBox.setValue(1.0); self.kpCoolBox.setDecimals(5)
-        self.kiCoolBox = QDoubleSpinBox(); self.kiCoolBox.setRange(0, 100); self.kiCoolBox.setValue(0.0); self.kiCoolBox.setDecimals(5)
-        self.kdCoolBox = QDoubleSpinBox(); self.kdCoolBox.setRange(0, 2000); self.kdCoolBox.setValue(0.0); self.kdCoolBox.setDecimals(5)
+        # Cascade PID spin boxes
+        self.kpCoreSurfBox = QDoubleSpinBox(); self.kpCoreSurfBox.setRange(0, 100); self.kpCoreSurfBox.setDecimals(5)
+        self.kiCoreSurfBox = QDoubleSpinBox(); self.kiCoreSurfBox.setRange(0, 100); self.kiCoreSurfBox.setDecimals(5)
+        self.kdCoreSurfBox = QDoubleSpinBox(); self.kdCoreSurfBox.setRange(0, 2000); self.kdCoreSurfBox.setDecimals(5)
+
+        self.kpSurfWaterBox = QDoubleSpinBox(); self.kpSurfWaterBox.setRange(0, 100); self.kpSurfWaterBox.setDecimals(5)
+        self.kiSurfWaterBox = QDoubleSpinBox(); self.kiSurfWaterBox.setRange(0, 100); self.kiSurfWaterBox.setDecimals(5)
+        self.kdSurfWaterBox = QDoubleSpinBox(); self.kdSurfWaterBox.setRange(0, 2000); self.kdSurfWaterBox.setDecimals(5)
+
+        self.kpWaterBox = QDoubleSpinBox(); self.kpWaterBox.setRange(0, 100); self.kpWaterBox.setDecimals(5)
+        self.kiWaterBox = QDoubleSpinBox(); self.kiWaterBox.setRange(0, 100); self.kiWaterBox.setDecimals(5)
+        self.kdWaterBox = QDoubleSpinBox(); self.kdWaterBox.setRange(0, 2000); self.kdWaterBox.setDecimals(5)
 
         self.lbl_core = QLabel("Core: --.- °C")
         self.lbl_water = QLabel("Water: --.- °C")
@@ -230,32 +253,27 @@ class MainWindow(QMainWindow):
         g.addWidget(QLabel("Set‑point °C"), 3, 0);
         g.addWidget(self.sp_set, 3, 1)
 
-        g.addWidget(QLabel("Heating PID"), 4, 0, 1, 2)
-        g.addWidget(QLabel("Kp"), 5, 0);
-        g.addWidget(self.kpHeatBox, 5, 1)
-        g.addWidget(QLabel("Ki"), 6, 0);
-        g.addWidget(self.kiHeatBox, 6, 1)
-        g.addWidget(QLabel("Kd"), 7, 0);
-        g.addWidget(self.kdHeatBox, 7, 1)
+        g.addWidget(QLabel("Core→Surface PID"), 4, 0, 1, 2)
+        g.addWidget(QLabel("Kp"), 5, 0); g.addWidget(self.kpCoreSurfBox, 5, 1)
+        g.addWidget(QLabel("Ki"), 6, 0); g.addWidget(self.kiCoreSurfBox, 6, 1)
+        g.addWidget(QLabel("Kd"), 7, 0); g.addWidget(self.kdCoreSurfBox, 7, 1)
 
-        g.addWidget(QLabel("Cooling PID"), 8, 0, 1, 2)
-        g.addWidget(QLabel("Kp"), 9, 0);
-        g.addWidget(self.kpCoolBox, 9, 1)
-        g.addWidget(QLabel("Ki"), 10, 0);
-        g.addWidget(self.kiCoolBox, 10, 1)
-        g.addWidget(QLabel("Kd"), 11, 0);
-        g.addWidget(self.kdCoolBox, 11, 1)
+        g.addWidget(QLabel("Surface→Water PID"), 8, 0, 1, 2)
+        g.addWidget(QLabel("Kp"), 9, 0); g.addWidget(self.kpSurfWaterBox, 9, 1)
+        g.addWidget(QLabel("Ki"), 10, 0); g.addWidget(self.kiSurfWaterBox, 10, 1)
+        g.addWidget(QLabel("Kd"), 11, 0); g.addWidget(self.kdSurfWaterBox, 11, 1)
 
-        g.addWidget(self.lbl_core, 12, 0, 1, 2);
-        g.addWidget(self.lbl_water, 13, 0, 1, 2)
-        g.addWidget(self.btn_start, 14, 0);
-        g.addWidget(self.btn_stop, 14, 1)
-        g.addWidget(self.btn_heat, 15, 0);
-        g.addWidget(self.btn_cool, 15, 1)
-        g.addWidget(self.btn_dwell, 16, 0);
-        g.addWidget(self.btn_standby, 16, 1)
-        g.addWidget(self.btn_export, 17, 0, 1, 2)
-        g.addWidget(self.graph, 0, 2, 18, 1)
+        g.addWidget(QLabel("Water PID"), 12, 0, 1, 2)
+        g.addWidget(QLabel("Kp"), 13, 0); g.addWidget(self.kpWaterBox, 13, 1)
+        g.addWidget(QLabel("Ki"), 14, 0); g.addWidget(self.kiWaterBox, 14, 1)
+        g.addWidget(QLabel("Kd"), 15, 0); g.addWidget(self.kdWaterBox, 15, 1)
+
+        g.addWidget(self.lbl_core, 16, 0, 1, 2); g.addWidget(self.lbl_water, 17, 0, 1, 2)
+        g.addWidget(self.btn_start, 18, 0); g.addWidget(self.btn_stop, 18, 1)
+        g.addWidget(self.btn_heat, 19, 0); g.addWidget(self.btn_cool, 19, 1)
+        g.addWidget(self.btn_dwell, 20, 0); g.addWidget(self.btn_standby, 20, 1)
+        g.addWidget(self.btn_export, 21, 0, 1, 2)
+        g.addWidget(self.graph, 0, 2, 22, 1)
 
 
 
@@ -284,46 +302,64 @@ class MainWindow(QMainWindow):
 
     def setup_tuning_tab(self):
         layout = QVBoxLayout()
-        self.load_heat_csv_btn = QPushButton("Load Heating Step Response")
-        self.load_cool_csv_btn = QPushButton("Load Cooling Step Response")
+        self.loop_select = QComboBox()
+        self.loop_select.addItems(["Core→Surface", "Surface→Water", "Water"])
+
+        self.load_csv_btn = QPushButton("Load Step Response")
         self.result_label = QLabel("PID parameters will appear here.")
         self.plot_canvas = MatplotCanvas(self)
 
-        self.load_heat_csv_btn.clicked.connect(lambda: self.load_and_fit_csv('heat'))
-        self.load_cool_csv_btn.clicked.connect(lambda: self.load_and_fit_csv('cool'))
+        self.load_csv_btn.clicked.connect(self.load_and_fit_csv)
 
-        layout.addWidget(self.load_heat_csv_btn)
-        layout.addWidget(self.load_cool_csv_btn)
+        layout.addWidget(self.loop_select)
+        layout.addWidget(self.load_csv_btn)
         layout.addWidget(self.result_label)
         layout.addWidget(self.plot_canvas)
         self.tuning_tab.setLayout(layout)
 
-    def load_and_fit_csv(self, mode):
+    def load_and_fit_csv(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV Files (*.csv)")
         if not file_path:
             return
 
         try:
-            df = pd.read_csv(file_path, index_col=False, encoding='cp1252', header=None)
+            df = pd.read_csv(file_path, index_col=False, encoding="cp1252", header=None)
+
             t = np.array([float(x) for x in df.iloc[0, 1:].dropna()])
             core = np.array([float(x) for x in df.iloc[1, 1:].dropna()])
-            water = np.array([float(x) for x in df.iloc[2, 1:].dropna()])
-            set_point = float(df.iloc[3, 1])
+
+            # Datasets exported with older versions may not include surface data
+            label = str(df.iloc[2, 0]).lower()
+            if "surface" in label:
+                surface = np.array([float(x) for x in df.iloc[2, 1:].dropna()])
+                water = np.array([float(x) for x in df.iloc[3, 1:].dropna()])
+                set_point = float(df.iloc[4, 1])
+            else:
+                surface = np.array([])
+                water = np.array([float(x) for x in df.iloc[2, 1:].dropna()])
+                set_point = float(df.iloc[3, 1])
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load CSV: {e}")
             return
 
         def foptd(t, K, tau, L):
-            T0 = core[0]
+            """First-order plus dead time model."""
+            T0 = y[0]
             T = np.piecewise(
-                t, [t < L, t >= L],
-                [lambda t: T0,
-                 lambda t: T0 + K * (1 - np.exp(-(t - L) / tau))]
+                t,
+                [t < L, t >= L],
+                [lambda t: T0, lambda t: T0 + K * (1 - np.exp(-(t - L) / tau))],
             )
             return T
 
         try:
-            params, _ = curve_fit(foptd, t, core, p0=[30, 300, 20])
+            loop = self.loop_select.currentText()
+            if loop == "Core→Surface" and surface.size:
+                y = surface
+            else:
+                y = water
+
+            params, _ = curve_fit(foptd, t, y, p0=[30, 300, 20])
             K, tau, L = abs(params)
             Kp = 1.2 * tau / (K * L)
             Ti = 2 * L
@@ -331,21 +367,31 @@ class MainWindow(QMainWindow):
             Ki = Kp / Ti
             Kd = Kp * Td
 
-            if mode == 'heat':
-                self.kpHeatBox.setValue(Kp)
-                self.kiHeatBox.setValue(Ki)
-                self.kdHeatBox.setValue(Kd)
-            elif mode == 'cool':
-                self.kpCoolBox.setValue(Kp)
-                self.kiCoolBox.setValue(Ki)
-                self.kdCoolBox.setValue(Kd)
+            if loop == "Core→Surface":
+                self.kpCoreSurfBox.setValue(Kp)
+                self.kiCoreSurfBox.setValue(Ki)
+                self.kdCoreSurfBox.setValue(Kd)
+            elif loop == "Surface→Water":
+                self.kpSurfWaterBox.setValue(Kp)
+                self.kiSurfWaterBox.setValue(Ki)
+                self.kdSurfWaterBox.setValue(Kd)
+            elif loop == "Water":
+                self.kpWaterBox.setValue(Kp)
+                self.kiWaterBox.setValue(Ki)
+                self.kdWaterBox.setValue(Kd)
 
             self.result_label.setText(
-                f"FOPTD Fit ({mode}): K={K:.2f}, tau={tau:.2f}, L={L:.2f}\n"
-                f"Ziegler-Nichols PID ({mode}): Kp={Kp:.3f}, Ki={Ki:.5f}, Kd={Kd:.3f}"
+                f"FOPTD Fit ({loop}): K={K:.2f}, tau={tau:.2f}, L={L:.2f}\n"
+                f"Ziegler-Nichols PID ({loop}): Kp={Kp:.3f}, Ki={Ki:.5f}, Kd={Kd:.3f}"
             )
 
-            self.plot_canvas.fit_plot(t, core, water, set_point, foptd, *params)
+            if surface.size:
+                surf_data = surface
+            else:
+                # keep array of NaNs for plotting alignment
+                surf_data = np.full_like(core, np.nan)
+
+            self.plot_canvas.fit_plot(t, core, surf_data, water, set_point, foptd, *params)
         except Exception as e:
             QMessageBox.critical(self, "Fitting Error", f"Could not fit model: {e}")
 
@@ -359,35 +405,44 @@ class MainWindow(QMainWindow):
         self.btn_standby.setEnabled(is_manual)
         self.btn_start.setEnabled(not is_manual)
         self.btn_stop.setEnabled(not is_manual)
-        self.kpHeatBox.setEnabled(is_auto)
-        self.kiHeatBox.setEnabled(is_auto)
-        self.kdHeatBox.setEnabled(is_auto)
-        self.kpCoolBox.setEnabled(is_auto)
-        self.kiCoolBox.setEnabled(is_auto)
-        self.kdCoolBox.setEnabled(is_auto)
+        self.kpCoreSurfBox.setEnabled(is_auto)
+        self.kiCoreSurfBox.setEnabled(is_auto)
+        self.kdCoreSurfBox.setEnabled(is_auto)
+        self.kpSurfWaterBox.setEnabled(is_auto)
+        self.kiSurfWaterBox.setEnabled(is_auto)
+        self.kdSurfWaterBox.setEnabled(is_auto)
+        self.kpWaterBox.setEnabled(is_auto)
+        self.kiWaterBox.setEnabled(is_auto)
+        self.kdWaterBox.setEnabled(is_auto)
 
     def load_pid_settings(self):
         if os.path.exists(PID_SETTINGS_FILE):
             try:
                 with open(PID_SETTINGS_FILE, 'r') as f:
                     data = json.load(f)
-                    self.kpHeatBox.setValue(data.get('kpHeat', 0.0))
-                    self.kiHeatBox.setValue(data.get('kiHeat', 0.0))
-                    self.kdHeatBox.setValue(data.get('kdHeat', 0.0))
-                    self.kpCoolBox.setValue(data.get('kpCool', 0.0))
-                    self.kiCoolBox.setValue(data.get('kiCool', 0.0))
-                    self.kdCoolBox.setValue(data.get('kdCool', 0.0))
+                    self.kpCoreSurfBox.setValue(data.get('kpCoreSurf', 0.0))
+                    self.kiCoreSurfBox.setValue(data.get('kiCoreSurf', 0.0))
+                    self.kdCoreSurfBox.setValue(data.get('kdCoreSurf', 0.0))
+                    self.kpSurfWaterBox.setValue(data.get('kpSurfWater', 0.0))
+                    self.kiSurfWaterBox.setValue(data.get('kiSurfWater', 0.0))
+                    self.kdSurfWaterBox.setValue(data.get('kdSurfWater', 0.0))
+                    self.kpWaterBox.setValue(data.get('kpWater', 0.0))
+                    self.kiWaterBox.setValue(data.get('kiWater', 0.0))
+                    self.kdWaterBox.setValue(data.get('kdWater', 0.0))
             except Exception as e:
                 print(f"Failed to load PID settings: {e}")
 
     def save_pid_settings(self):
         data = {
-            'kpHeat': self.kpHeatBox.value(),
-            'kiHeat': self.kiHeatBox.value(),
-            'kdHeat': self.kdHeatBox.value(),
-            'kpCool': self.kpCoolBox.value(),
-            'kiCool': self.kiCoolBox.value(),
-            'kdCool': self.kdCoolBox.value()
+            'kpCoreSurf': self.kpCoreSurfBox.value(),
+            'kiCoreSurf': self.kiCoreSurfBox.value(),
+            'kdCoreSurf': self.kdCoreSurfBox.value(),
+            'kpSurfWater': self.kpSurfWaterBox.value(),
+            'kiSurfWater': self.kiSurfWaterBox.value(),
+            'kdSurfWater': self.kdSurfWaterBox.value(),
+            'kpWater': self.kpWaterBox.value(),
+            'kiWater': self.kiWaterBox.value(),
+            'kdWater': self.kdWaterBox.value()
         }
         try:
             with open(PID_SETTINGS_FILE, 'w') as f:
@@ -445,19 +500,26 @@ class MainWindow(QMainWindow):
 
         self.t.clear()
         self.core.clear()
+        self.surface = []
         self.water.clear()
 
-        # Initialize PID controllers from control tab spinboxes
-        self.pid_heating = PIDController(
-            self.kpHeatBox.value(),
-            self.kiHeatBox.value(),
-            self.kdHeatBox.value(),
+        # Initialize cascade PID controllers from control tab spinboxes
+        self.pid_core_surface = PIDController(
+            self.kpCoreSurfBox.value(),
+            self.kiCoreSurfBox.value(),
+            self.kdCoreSurfBox.value(),
             setpoint
         )
-        self.pid_cooling = PIDController(
-            self.kpCoolBox.value(),
-            self.kiCoolBox.value(),
-            self.kdCoolBox.value(),
+        self.pid_surface_water = PIDController(
+            self.kpSurfWaterBox.value(),
+            self.kiSurfWaterBox.value(),
+            self.kdSurfWaterBox.value(),
+            setpoint
+        )
+        self.pid_water = PIDController(
+            self.kpWaterBox.value(),
+            self.kiWaterBox.value(),
+            self.kdWaterBox.value(),
             setpoint
         )
 
@@ -482,11 +544,11 @@ class MainWindow(QMainWindow):
                 dt = now - self.last_time
                 self.last_time = now
                 try:
-                    core, _, water = await self.thermo.temperature_read()
+                    core, surface, water = await self.thermo.temperature_read()
                     self.lbl_core.setText(f"Core: {core:.1f} °C")
                     self.lbl_water.setText(f"Water: {water:.1f} °C")
                     self.t.append(now - t0)
-                    self.core.append(core); self.water.append(water)
+                    self.core.append(core); self.surface.append(surface); self.water.append(water)
 
                     setpoint = self.sp_set.value()
                     self.redraw()
@@ -504,16 +566,19 @@ class MainWindow(QMainWindow):
                             await self.cooker.dwell()
 
                     elif mode == "PID Auto":
-                        error = setpoint - core
-                        band = 2.0  # °C transition band
-                        alpha = np.clip(0.5 + 0.5 * (error / band), 0.0, 1.0)
+                        # Cascade PID control: core→surface→water
+                        self.pid_core_surface.target_temperature = setpoint
+                        surface_sp = self.pid_core_surface.calculate(core, dt)
 
-                        heating_output = self.pid_heating.calculate(core, dt) if self.pid_heating else 0
-                        cooling_output = self.pid_cooling.calculate(core, dt) if self.pid_cooling else 0
+                        self.pid_surface_water.target_temperature = surface_sp
+                        water_sp = self.pid_surface_water.calculate(surface, dt)
 
-                        output = alpha * heating_output + (1 - alpha) * cooling_output
+                        self.pid_water.target_temperature = water_sp
+                        output = self.pid_water.calculate(water, dt)
 
-                        print(f"[CONTROL] PID Auto, Error: {error:.2f}, Alpha: {alpha:.2f}, Output: {output:.2f}")
+                        print(
+                            f"[CASCADE] core_sp={setpoint:.1f}, surf_sp={surface_sp:.1f}, water_sp={water_sp:.1f}, out={output:.2f}"
+                        )
 
                         if output > 1:
                             await self.cooker.heat()
@@ -530,10 +595,13 @@ class MainWindow(QMainWindow):
 
     def redraw(self):
         if self.t:
-            self.graph.plot_data(np.array(self.t),
-                                 np.array(self.core),
-                                 np.array(self.water),
-                                 self.sp_set.value())
+            self.graph.plot_data(
+                np.array(self.t),
+                np.array(self.core),
+                np.array(self.surface),
+                np.array(self.water),
+                self.sp_set.value(),
+            )
 
     def export_data(self):
         if not self.t:
@@ -542,7 +610,15 @@ class MainWindow(QMainWindow):
 
         filename, _ = QFileDialog.getSaveFileName(self, "Save CSV", "sous_vide_data.csv", "CSV Files (*.csv)")
         if filename:
-            exporter(self.t, self.core, self.water, self.sp_set.value(), ["running"]*len(self.t), filename)
+            exporter(
+                self.t,
+                self.core,
+                self.surface,
+                self.water,
+                self.sp_set.value(),
+                ["running"] * len(self.t),
+                filename,
+            )
 
     def closeEvent(self, event):
         # Save PID settings on exit
