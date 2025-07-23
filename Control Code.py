@@ -232,6 +232,7 @@ class MainWindow(QMainWindow):
         self.kdWaterBox = QDoubleSpinBox(); self.kdWaterBox.setRange(0, 2000); self.kdWaterBox.setDecimals(5)
 
         self.lbl_core = QLabel("Core: --.- °C")
+        self.lbl_surface = QLabel("Surface: --.- °C")
         self.lbl_water = QLabel("Water: --.- °C")
         self.btn_start = QPushButton("Start")
         self.btn_stop = QPushButton("Stop")
@@ -268,12 +269,12 @@ class MainWindow(QMainWindow):
         g.addWidget(QLabel("Ki"), 14, 0); g.addWidget(self.kiWaterBox, 14, 1)
         g.addWidget(QLabel("Kd"), 15, 0); g.addWidget(self.kdWaterBox, 15, 1)
 
-        g.addWidget(self.lbl_core, 16, 0, 1, 2); g.addWidget(self.lbl_water, 17, 0, 1, 2)
-        g.addWidget(self.btn_start, 18, 0); g.addWidget(self.btn_stop, 18, 1)
-        g.addWidget(self.btn_heat, 19, 0); g.addWidget(self.btn_cool, 19, 1)
-        g.addWidget(self.btn_dwell, 20, 0); g.addWidget(self.btn_standby, 20, 1)
-        g.addWidget(self.btn_export, 21, 0, 1, 2)
-        g.addWidget(self.graph, 0, 2, 22, 1)
+        g.addWidget(self.lbl_core, 16, 0, 1, 2); g.addWidget(self.lbl_surface, 17, 0, 1, 2); g.addWidget(self.lbl_water, 18, 0, 1, 2)
+        g.addWidget(self.btn_start, 19, 0); g.addWidget(self.btn_stop, 19, 1)
+        g.addWidget(self.btn_heat, 20, 0); g.addWidget(self.btn_cool, 20, 1)
+        g.addWidget(self.btn_dwell, 21, 0); g.addWidget(self.btn_standby, 21, 1)
+        g.addWidget(self.btn_export, 22, 0, 1, 2)
+        g.addWidget(self.graph, 0, 2, 23, 1)
 
 
 
@@ -546,6 +547,7 @@ class MainWindow(QMainWindow):
                 try:
                     core, surface, water = await self.thermo.temperature_read()
                     self.lbl_core.setText(f"Core: {core:.1f} °C")
+                    self.lbl_surface.setText(f"Surface: {surface:.1f} °C")
                     self.lbl_water.setText(f"Water: {water:.1f} °C")
                     self.t.append(now - t0)
                     self.core.append(core); self.surface.append(surface); self.water.append(water)
@@ -580,7 +582,7 @@ class MainWindow(QMainWindow):
                             f"[CASCADE] core_sp={setpoint:.1f}, surf_sp={surface_sp:.1f}, water_sp={water_sp:.1f}, out={output:.2f}"
                         )
 
-                        if output > 1:
+                        if output > 1 and water < 82.5:
                             await self.cooker.heat()
                         elif output < -1:
                             await self.cooker.cool()
