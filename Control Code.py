@@ -8,8 +8,10 @@ from bleak import BleakClient, BleakError
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 import matplotlib.pyplot as plt
 import pandas as pd
-from scipy.optimize import curve_fit
 import csv
+import optuna
+from typing import Callable, Sequence, Union, Optional, Dict
+import scipy.stats as st
 
 GRAPH_INTERVAL = 1000           # ms between redraws
 CONTROL_INTERVAL = 2           # s between PID decisions
@@ -28,23 +30,209 @@ def exporter(time_s, core_temp, surface_temp, water_temp, set_temp, state, file_
         writer.writerow(["Set Temp (°C)", set_temp])
         writer.writerow(["State", *state])
 
-class PIDController:
-    def __init__(self, kp, ki, kd, target_temperature):
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-        self.target_temperature = target_temperature
-        self.integral = 0
-        self.previous_error = 0
+class simulateCoolingSchedule():
+    def __init__(self, setpoint):
+        self.time = None
+        self.Tc = None
+        self.Ts = None
+        self.Tw = None
+        self.target_core = setpoint
 
-    def calculate(self, current_temperature, dt):
-        error = self.target_temperature - current_temperature
-        p = self.kp * error
-        self.integral += error * dt
-        i = self.ki * self.integral
-        d = self.kd * (error - self.previous_error) / dt
-        self.previous_error = error
-        return p + i + d
+
+    def calculateParameters(self, time, Tc, Ts, Tw):
+
+        self.time = time
+        self.Tc = Tc
+        self.Ts = Ts
+        self.Tw = Tw
+
+        # ---------------------------------------------------------------
+        # 2)  Numerical derivatives  (central difference)
+        # ---------------------------------------------------------------
+        dTc_dt = np.gradient(self.Tc, self.time)
+        dTs_dt = np.gradient(self.Ts, self.time)
+
+        # ---------------------------------------------------------------
+        # 3)  Linear fit for  a  in   dTc/dt = a·(Ts-Tc)
+        # ---------------------------------------------------------------
+        X_a = self.Ts - self.Tc
+        Y_a = dTc_dt
+        mask_a = np.abs(X_a) > 1e-3  # avoid divide-by-0
+        Xa, Ya = X_a[mask_a], Y_a[mask_a]
+
+        self.a_hat = (Xa @ Ya) / (Xa @ Xa)  # slope through origin
+        res_a = Ya - self.a_hat * Xa
+        n_a = len(Xa)
+        sigma2a = (res_a @ res_a) / (n_a - 1)
+        var_a = sigma2a / (Xa @ Xa)
+        se_a = np.sqrt(var_a)
+        self.ci_a = self.a_hat + st.t.ppf([0.025, 0.975], df=n_a - 1) * se_a
+
+        # ---------------------------------------------------------------
+        # 4)  Linear fit for  b  in   dTs/dt + a(Ts-Tc) = b·(Tw-Ts)
+        # ---------------------------------------------------------------
+        Y_b = dTs_dt + self.a_hat * (self.Ts - self.Tc)
+        X_b = self.Tw - self.Ts
+        mask_b = np.abs(X_b) > 1e-3
+        Xb, Yb = X_b[mask_b], Y_b[mask_b]
+
+        self.b_hat = (Xb @ Yb) / (Xb @ Xb)
+        res_b = Yb - self.b_hat * Xb
+        n_b = len(Xb)
+        sigma2b = (res_b @ res_b) / (n_b - 1)
+        var_b = sigma2b / (Xb @ Xb)
+        se_b = np.sqrt(var_b)
+        self.ci_b = self.b_hat + st.t.ppf([0.025, 0.975], df=n_b - 1) * se_b
+
+    def calculateEffectiveWaterMass(self, time, Tw):
+
+        self.time = time
+        self.Tw = Tw
+
+        dTw_dt = np.gradient(self.Tw, self.time)
+        # ---------------------------------------------------------------
+        # 4)  Linear fit for  m  in   dTw/dt = 1/M·(Ph - Kloss*(Tw-Ta))/Cp
+        # ---------------------------------------------------------------
+        Ph, Kloss, Ta, Cp = [1500, 16.94, 25.0, 4180]
+        X_m = (Ph - Kloss * (self.Tw[:800] - Ta)) / Cp
+        Y_m = dTw_dt[:800]
+        mask_m = np.abs(X_m) > 1e-3
+        Xm, Ym = X_m[mask_m], Y_m[mask_m]
+
+        self.m_hat = (Xm @ Xm) / (Xm @ Ym)
+        res_m = Ym - self.m_hat * Xm
+        n_m = len(Xm)
+        sigma2m = (res_m @ res_m) / (n_m - 1)
+        var_m = sigma2m / (Xm @ Xm)
+        se_m = np.sqrt(var_m)
+        self.ci_m = self.m_hat + st.t.ppf([0.025, 0.975], df=n_m - 1) * se_m
+
+
+    async def predictCoolingTime(self):
+
+        def simulate_pork(hte: int,
+                          Tw0: float = self.Tw[0],
+                          Ts0: float = self.Ts[0],
+                          Tc0: float = self.Tc[0],
+                          *,
+                          a: float = self.a_hat,  # conduction rate (surface -> core), 1/s
+                          b: float = self.b_hat,  # convection rate (water -> surface), 1/s
+                          m_water: float = self.m_hat,
+                          cp_water: float = 4186,
+                          P_heater: float = 1500,
+                          Tw_max: float = 82.5,
+                          Ta: float = 25.0,
+                          Target_Core: float = self.target_core,
+                          k_loss: float = 16.94,
+                          ) -> Dict[str, np.ndarray]:
+
+            duration_s = 60 * 60  # 60 minutes
+            dt = 1.0
+            steps = int(duration_s / dt) + 1
+            t = np.arange(0, steps) * dt
+
+            N = int(duration_s / dt) + 1
+            heater = np.zeros(N)
+            heater[:hte] = 1.0
+
+            cooler = np.zeros(N)
+            cooler[hte:] = 1.0
+
+            def get_val(src, time_s, lo=0.0, hi=1.0):
+                if callable(src):
+                    val = float(src(time_s))
+                else:
+                    idx = min(int(time_s / dt), len(src) - 1)
+                    val = float(src[idx])
+                return max(lo, min(hi, val))
+
+            def cooling_power_from_T(Tw):
+                """Return cooling power (W, negative) for current water temperature."""
+                poly_params = [2.27547663e-17, -1.12684201e-14, 2.11045586e-12, -1.52660048e-10,
+                               -3.27284087e-09, 9.72591370e-07, 1.61182038e-06, -5.78630618e-03,
+                               7.22094130e-02, 3.16146892e+01, -1.23925959e+03, -1.16861980e+05,
+                               1.27332931e+07, -5.16289868e+08, 1.01934107e+10, -8.17727003e+10]
+                if Tw < 50:
+                    return -120.0  # below melt range, basically no cooling
+                if Tw > 82.5:
+                    Tw = 82.5
+
+                return np.polyval(poly_params, Tw)
+
+            Tw = np.empty(steps)
+            Ts = np.empty(steps)
+            Tc = np.empty(steps)
+            u_heat = np.zeros(steps)
+            u_cool = np.zeros(steps)
+
+            Tw[0], Ts[0], Tc[0] = Tw0, Ts0, Tc0
+            Cw = m_water * cp_water
+            chiller_on = False
+
+            for k in range(1, steps):
+                time_s = t[k]
+
+                # Heater duty
+                u = get_val(heater, time_s, 0.0, 1.0)
+                u_heat[k] = u
+
+                # Cooler on/off
+                cool_cmd = get_val(cooler, time_s, 0.0, 1.0) > 0.5
+                u_cool[k] = cool_cmd
+                if cool_cmd and not chiller_on:
+                    chiller_on = True
+                    t_on_cool = 0.0
+                elif not cool_cmd:
+                    chiller_on = False
+                    t_on_cool = 0.0
+
+                if chiller_on:
+                    Pc = cooling_power_from_T(Tw[k - 1])  # negative W
+                else:
+                    Pc = 0.0
+
+                # Water dynamics
+                P_net = P_heater * u + Pc - k_loss * (Tw[k - 1] - Ta)
+                Tw[k] = Tw[k - 1] + (P_net / Cw) * dt
+                if Tw[k] > Tw_max:
+                    Tw[k] = Tw_max
+
+                # Pork nodes
+                dTs = b * (Tw[k] - Ts[k - 1]) - a * (Ts[k - 1] - Tc[k - 1])
+                dTc = a * (Ts[k - 1] - Tc[k - 1])
+                Ts[k] = Ts[k - 1] + dTs * dt
+                Tc[k] = Tc[k - 1] + dTc * dt
+
+            target_error = abs(max(Tc) - Target_Core)
+            time_idx = np.where(Tc >= Target_Core)
+            if len(time_idx[0]) == 0:
+                target_time = float(99999)
+            else:
+                target_time = t[time_idx[0][0]] / 60
+
+            return {"t": t, "Tw": Tw, "Ts": Ts, "Tc": Tc, "u_heat": u_heat, "u_cool": u_cool, 'cool start': t[hte],
+                    "target_error": target_error, "target_time": target_time}
+
+        def objective(trial):
+            hte = trial.suggest_int('hte', 0, 4000)
+
+            res = simulate_pork(hte)
+
+            core_error, time = res['target_error'], res['target_time']
+
+            return core_error, time
+
+        study = optuna.create_study(directions=['minimize', 'minimize'])
+        study.optimize(objective, n_trials=500)
+
+        print(study.best_trials[0].values)
+        print(study.best_trials[0].params)
+
+        hte = study.best_trials[0].params['hte']
+
+        res = simulate_pork(hte)
+
+        return res
 
 class thermoprobe:
     UUID = '00000101-CAAB-3792-3D44-97AE51C1407A'
@@ -140,36 +328,32 @@ class MatplotCanvas(FigureCanvasQTAgg):
             "surface": self.ax.plot([], [], 'm-', label="Surface")[0],
             "water":   self.ax.plot([], [], 'b-', label="Water")[0],
             "set":     self.ax.plot([], [], 'k--', label="Set‑point")[0],
-            "foptd":   self.ax.plot([], [], 'g--', label="FOPTD Fit")[0],
+            "core sim":   self.ax.plot([], [], 'r--', label="Core sim")[0],
+            "surface sim": self.ax.plot([], [], 'm--', label="Surface sim")[0],
+            "water sim": self.ax.plot([], [], 'b--', label="Water sim")[0],
         }
         self.ax.legend()
 
-    def plot_data(self, t, core, surface, water, setpoint):
+    def plot_data(self, t, core, surface, water, setpoint, time_sim, core_sim, surface_sim, water_sim):
         """Update graph with new measurements."""
         for k, y in [
             ("core", core),
             ("surface", surface),
             ("water", water),
-            ("set", np.full_like(core, setpoint)),
-        ]:
+            ("set", np.full_like(core, setpoint))
+            ]:
             self.lines[k].set_data(t / 60, y)
+        for k, y in [
+            ("core sim", core_sim),
+            ("surface sim", surface_sim),
+            ("water sim", water_sim)
+             ]:
+            self.lines[k].set_data(time_sim / 60, y)
         self.ax.relim()
         self.ax.autoscale_view()
         self.draw_idle()
 
-    def fit_plot(self, t, core, surface, water, setpoint, foptd, *params):
-        """Plot the FOPTD fit alongside measured data."""
-        for k, y in [
-            ("core", core),
-            ("surface", surface),
-            ("water", water),
-            ("set", np.full_like(core, setpoint)),
-            ("foptd", foptd(t, *params)),
-        ]:
-            self.lines[k].set_data(t / 60, y)
-        self.ax.relim()
-        self.ax.autoscale_view()
-        self.draw_idle()
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -193,11 +377,8 @@ class MainWindow(QMainWindow):
         self.thermo = thermoprobe(PROBE_MAC)
         self.cooker = cooker(COOKER_MAC)
         self.task_loop = None
-        self.t, self.core, self.surface, self.water = [], [], [], []
+        self.t, self.core, self.surface, self.water, self.time_sim, self.core_sim, self.surface_sim, self.water_sim = [], [], [], [], [], [], [], []
         self.running = False
-        self.pid_core_surface = None
-        self.pid_surface_water = None
-        self.pid_water = None
 
         self.last_time = time.time()
 
@@ -215,21 +396,7 @@ class MainWindow(QMainWindow):
         self.modeBox.addItems(["Manual", "Normal", "PID Auto"])
         self.modeBox.currentTextChanged.connect(self.mode_changed)
 
-        self.sp_set = QSpinBox(); self.sp_set.setRange(20, 95); self.sp_set.setValue(55)
-
-
-        # Cascade PID spin boxes
-        self.kpCoreSurfBox = QDoubleSpinBox(); self.kpCoreSurfBox.setRange(0, 100); self.kpCoreSurfBox.setDecimals(5)
-        self.kiCoreSurfBox = QDoubleSpinBox(); self.kiCoreSurfBox.setRange(0, 100); self.kiCoreSurfBox.setDecimals(5)
-        self.kdCoreSurfBox = QDoubleSpinBox(); self.kdCoreSurfBox.setRange(0, 2000); self.kdCoreSurfBox.setDecimals(5)
-
-        self.kpSurfWaterBox = QDoubleSpinBox(); self.kpSurfWaterBox.setRange(0, 100); self.kpSurfWaterBox.setDecimals(5)
-        self.kiSurfWaterBox = QDoubleSpinBox(); self.kiSurfWaterBox.setRange(0, 100); self.kiSurfWaterBox.setDecimals(5)
-        self.kdSurfWaterBox = QDoubleSpinBox(); self.kdSurfWaterBox.setRange(0, 2000); self.kdSurfWaterBox.setDecimals(5)
-
-        self.kpWaterBox = QDoubleSpinBox(); self.kpWaterBox.setRange(0, 100); self.kpWaterBox.setDecimals(5)
-        self.kiWaterBox = QDoubleSpinBox(); self.kiWaterBox.setRange(0, 100); self.kiWaterBox.setDecimals(5)
-        self.kdWaterBox = QDoubleSpinBox(); self.kdWaterBox.setRange(0, 2000); self.kdWaterBox.setDecimals(5)
+        self.sp_set = QSpinBox(); self.sp_set.setRange(20, 82); self.sp_set.setValue(55)
 
         self.lbl_core = QLabel("Core: --.- °C")
         self.lbl_surface = QLabel("Surface: --.- °C")
@@ -254,32 +421,12 @@ class MainWindow(QMainWindow):
         g.addWidget(QLabel("Set‑point °C"), 3, 0);
         g.addWidget(self.sp_set, 3, 1)
 
-        g.addWidget(QLabel("Core→Surface PID"), 4, 0, 1, 2)
-        g.addWidget(QLabel("Kp"), 5, 0); g.addWidget(self.kpCoreSurfBox, 5, 1)
-        g.addWidget(QLabel("Ki"), 6, 0); g.addWidget(self.kiCoreSurfBox, 6, 1)
-        g.addWidget(QLabel("Kd"), 7, 0); g.addWidget(self.kdCoreSurfBox, 7, 1)
-
-        g.addWidget(QLabel("Surface→Water PID"), 8, 0, 1, 2)
-        g.addWidget(QLabel("Kp"), 9, 0); g.addWidget(self.kpSurfWaterBox, 9, 1)
-        g.addWidget(QLabel("Ki"), 10, 0); g.addWidget(self.kiSurfWaterBox, 10, 1)
-        g.addWidget(QLabel("Kd"), 11, 0); g.addWidget(self.kdSurfWaterBox, 11, 1)
-
-        g.addWidget(QLabel("Water PID"), 12, 0, 1, 2)
-        g.addWidget(QLabel("Kp"), 13, 0); g.addWidget(self.kpWaterBox, 13, 1)
-        g.addWidget(QLabel("Ki"), 14, 0); g.addWidget(self.kiWaterBox, 14, 1)
-        g.addWidget(QLabel("Kd"), 15, 0); g.addWidget(self.kdWaterBox, 15, 1)
-
-        g.addWidget(self.lbl_core, 16, 0, 1, 2); g.addWidget(self.lbl_surface, 17, 0, 1, 2); g.addWidget(self.lbl_water, 18, 0, 1, 2)
-        g.addWidget(self.btn_start, 19, 0); g.addWidget(self.btn_stop, 19, 1)
-        g.addWidget(self.btn_heat, 20, 0); g.addWidget(self.btn_cool, 20, 1)
-        g.addWidget(self.btn_dwell, 21, 0); g.addWidget(self.btn_standby, 21, 1)
-        g.addWidget(self.btn_export, 22, 0, 1, 2)
-        g.addWidget(self.graph, 0, 2, 23, 1)
-
-
-
-        # Load PID gains from file if available
-        self.load_pid_settings()
+        g.addWidget(self.lbl_core, 4, 0, 1, 2); g.addWidget(self.lbl_surface, 5, 0, 1, 2); g.addWidget(self.lbl_water, 6, 0, 1, 2)
+        g.addWidget(self.btn_start, 7, 0); g.addWidget(self.btn_stop, 8, 1)
+        g.addWidget(self.btn_heat, 9, 0); g.addWidget(self.btn_cool, 10, 1)
+        g.addWidget(self.btn_dwell, 11, 0); g.addWidget(self.btn_standby, 12, 1)
+        g.addWidget(self.btn_export, 13, 0, 1, 2)
+        g.addWidget(self.graph, 0, 2, 14, 1)
 
         # ---------- signals ----------
         self.btn_probe.clicked.connect(lambda: asyncio.create_task(self.handle_probe()))
@@ -318,85 +465,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.plot_canvas)
         self.tuning_tab.setLayout(layout)
 
-    def load_and_fit_csv(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV Files (*.csv)")
-        if not file_path:
-            return
-
-        try:
-            df = pd.read_csv(file_path, index_col=False, encoding="cp1252", header=None)
-
-            t = np.array([float(x) for x in df.iloc[0, 1:].dropna()])
-            core = np.array([float(x) for x in df.iloc[1, 1:].dropna()])
-
-            # Datasets exported with older versions may not include surface data
-            label = str(df.iloc[2, 0]).lower()
-            if "surface" in label:
-                surface = np.array([float(x) for x in df.iloc[2, 1:].dropna()])
-                water = np.array([float(x) for x in df.iloc[3, 1:].dropna()])
-                set_point = float(df.iloc[4, 1])
-            else:
-                surface = np.array([])
-                water = np.array([float(x) for x in df.iloc[2, 1:].dropna()])
-                set_point = float(df.iloc[3, 1])
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load CSV: {e}")
-            return
-
-        def foptd(t, K, tau, L):
-            """First-order plus dead time model."""
-            T0 = y[0]
-            T = np.piecewise(
-                t,
-                [t < L, t >= L],
-                [lambda t: T0, lambda t: T0 + K * (1 - np.exp(-(t - L) / tau))],
-            )
-            return T
-
-        try:
-            loop = self.loop_select.currentText()
-            if loop == "Core→Surface" and surface.size:
-                y = surface
-            else:
-                y = water
-
-            params, _ = curve_fit(foptd, t, y, p0=[30, 300, 20])
-            K, tau, L = abs(params)
-            Kp = 1.2 * tau / (K * L)
-            Ti = 2 * L
-            Td = 0.5 * L
-            Ki = Kp / Ti
-            Kd = Kp * Td
-
-            if loop == "Core→Surface":
-                self.kpCoreSurfBox.setValue(Kp)
-                self.kiCoreSurfBox.setValue(Ki)
-                self.kdCoreSurfBox.setValue(Kd)
-            elif loop == "Surface→Water":
-                self.kpSurfWaterBox.setValue(Kp)
-                self.kiSurfWaterBox.setValue(Ki)
-                self.kdSurfWaterBox.setValue(Kd)
-            elif loop == "Water":
-                self.kpWaterBox.setValue(Kp)
-                self.kiWaterBox.setValue(Ki)
-                self.kdWaterBox.setValue(Kd)
-
-            self.result_label.setText(
-                f"FOPTD Fit ({loop}): K={K:.2f}, tau={tau:.2f}, L={L:.2f}\n"
-                f"Ziegler-Nichols PID ({loop}): Kp={Kp:.3f}, Ki={Ki:.5f}, Kd={Kd:.3f}"
-            )
-
-            if surface.size:
-                surf_data = surface
-            else:
-                # keep array of NaNs for plotting alignment
-                surf_data = np.full_like(core, np.nan)
-
-            self.plot_canvas.fit_plot(t, core, surf_data, water, set_point, foptd, *params)
-        except Exception as e:
-            QMessageBox.critical(self, "Fitting Error", f"Could not fit model: {e}")
-
-
     def mode_changed(self, text):
         is_manual = (text == "Manual")
         is_auto = (text == 'PID Auto')
@@ -406,50 +474,6 @@ class MainWindow(QMainWindow):
         self.btn_standby.setEnabled(is_manual)
         self.btn_start.setEnabled(not is_manual)
         self.btn_stop.setEnabled(not is_manual)
-        self.kpCoreSurfBox.setEnabled(is_auto)
-        self.kiCoreSurfBox.setEnabled(is_auto)
-        self.kdCoreSurfBox.setEnabled(is_auto)
-        self.kpSurfWaterBox.setEnabled(is_auto)
-        self.kiSurfWaterBox.setEnabled(is_auto)
-        self.kdSurfWaterBox.setEnabled(is_auto)
-        self.kpWaterBox.setEnabled(is_auto)
-        self.kiWaterBox.setEnabled(is_auto)
-        self.kdWaterBox.setEnabled(is_auto)
-
-    def load_pid_settings(self):
-        if os.path.exists(PID_SETTINGS_FILE):
-            try:
-                with open(PID_SETTINGS_FILE, 'r') as f:
-                    data = json.load(f)
-                    self.kpCoreSurfBox.setValue(data.get('kpCoreSurf', 0.0))
-                    self.kiCoreSurfBox.setValue(data.get('kiCoreSurf', 0.0))
-                    self.kdCoreSurfBox.setValue(data.get('kdCoreSurf', 0.0))
-                    self.kpSurfWaterBox.setValue(data.get('kpSurfWater', 0.0))
-                    self.kiSurfWaterBox.setValue(data.get('kiSurfWater', 0.0))
-                    self.kdSurfWaterBox.setValue(data.get('kdSurfWater', 0.0))
-                    self.kpWaterBox.setValue(data.get('kpWater', 0.0))
-                    self.kiWaterBox.setValue(data.get('kiWater', 0.0))
-                    self.kdWaterBox.setValue(data.get('kdWater', 0.0))
-            except Exception as e:
-                print(f"Failed to load PID settings: {e}")
-
-    def save_pid_settings(self):
-        data = {
-            'kpCoreSurf': self.kpCoreSurfBox.value(),
-            'kiCoreSurf': self.kiCoreSurfBox.value(),
-            'kdCoreSurf': self.kdCoreSurfBox.value(),
-            'kpSurfWater': self.kpSurfWaterBox.value(),
-            'kiSurfWater': self.kiSurfWaterBox.value(),
-            'kdSurfWater': self.kdSurfWaterBox.value(),
-            'kpWater': self.kpWaterBox.value(),
-            'kiWater': self.kiWaterBox.value(),
-            'kdWater': self.kdWaterBox.value()
-        }
-        try:
-            with open(PID_SETTINGS_FILE, 'w') as f:
-                json.dump(data, f)
-        except Exception as e:
-            print(f"Failed to save PID settings: {e}")
 
     async def handle_probe(self):
         try:
@@ -501,29 +525,14 @@ class MainWindow(QMainWindow):
 
         self.t.clear()
         self.core.clear()
-        self.surface = []
+        self.surface.clear()
         self.water.clear()
+        self.time_sim.clear()
+        self.core_sim.clear()
+        self.surface_sim.clear()
+        self.water_sim.clear()
 
-        # Initialize cascade PID controllers from control tab spinboxes
-        self.pid_core_surface = PIDController(
-            self.kpCoreSurfBox.value(),
-            self.kiCoreSurfBox.value(),
-            self.kdCoreSurfBox.value(),
-            setpoint
-        )
-        self.pid_surface_water = PIDController(
-            self.kpSurfWaterBox.value(),
-            self.kiSurfWaterBox.value(),
-            self.kdSurfWaterBox.value(),
-            setpoint
-        )
-        self.pid_water = PIDController(
-            self.kpWaterBox.value(),
-            self.kiWaterBox.value(),
-            self.kdWaterBox.value(),
-            setpoint
-        )
-
+        self.simulator = simulateCoolingSchedule(setpoint)
         mode = self.modeBox.currentText()
         self.running = True
         self.last_time = time.time()
@@ -540,6 +549,11 @@ class MainWindow(QMainWindow):
     async def control_loop(self, mode):
         try:
             t0 = time.time()
+            mass_latch = False
+            heating_latch = True
+            cooling_latch = False
+            coolingStart = None
+
             while self.running:
                 now = time.time()
                 dt = now - self.last_time
@@ -568,27 +582,40 @@ class MainWindow(QMainWindow):
                             await self.cooker.dwell()
 
                     elif mode == "PID Auto":
-                        # Cascade PID control: core→surface→water
-                        self.pid_core_surface.target_temperature = setpoint
-                        surface_sp = self.pid_core_surface.calculate(core, dt)
 
-                        self.pid_surface_water.target_temperature = surface_sp
-                        water_sp = self.pid_surface_water.calculate(surface, dt)
+                        if coolingStart and (now - t0) > coolingStart:
+                            heating_latch = False
+                            cooling_latch = True
 
-                        self.pid_water.target_temperature = water_sp
-                        output = self.pid_water.calculate(water, dt)
+                        if (now - t0) >= 60*8 and not mass_latch and heating_latch:
 
-                        print(
-                            f"[CASCADE] core_sp={setpoint:.1f}, surf_sp={surface_sp:.1f}, water_sp={water_sp:.1f}, out={output:.2f}"
-                        )
+                            self.simulator.calculateParameters(self.t, self.core, self.surface, self.water)
+                            print(f'Conduction Coefficient: {self.simulator.a_hat} || Convection Coefficient: {self.simulator.b_hat}')
+                            self.simulator.calculateEffectiveWaterMass(self.t, self.water)
+                            mass_latch = True
+                            print(f'Effective Water Mass: {self.simulator.m_hat}')
+                            res = await self.simulator.predictCoolingTime()
+                            coolingStart = res['cool start']
+                            self.time_sim, self.core_sim, self.surface_sim, self.water_sim = [res['t'], res['Tc'],
+                                                                                              res['Ts'], res['Tw']]
+                            print(f'Cooling Start Time: {coolingStart/60} min')
 
-                        if output > 1 and water < 82.5:
+                        if ((now - t0)%300) - (((now-dt) - t0)%300) < 0 and not mass_latch and heating_latch:
+                            print('Updating Prediction...')
+                            self.simulator.calculateParameters(self.t, self.core, self.surface, self.water)
+                            print(f'Conduction Coefficient: {self.simulator.a_hat} || Convection Coefficient: {self.simulator.b_hat}')
+                            res = await self.simulator.predictCoolingTime()
+                            coolingStart = res['cool start']
+                            self.time_sim, self.core_sim, self.surface_sim, self.water_sim = [res['t'], res['Tc'],
+                                                                                              res['Ts'], res['Tw']]
+                            print(f'Cooling Start Time: {coolingStart}')
+
+                        if heating_latch and water < 82.5:
                             await self.cooker.heat()
-                        elif output < -1:
+                        elif cooling_latch:
                             await self.cooker.cool()
                         else:
                             await self.cooker.dwell()
-
 
                 except Exception as e:
                     print(f"[ERROR] Control loop exception: {e}")
@@ -603,6 +630,10 @@ class MainWindow(QMainWindow):
                 np.array(self.surface),
                 np.array(self.water),
                 self.sp_set.value(),
+                np.array(self.time_sim),
+                np.array(self.core_sim),
+                np.array(self.surface_sim),
+                np.array(self.water_sim)
             )
 
     def export_data(self):
@@ -623,8 +654,6 @@ class MainWindow(QMainWindow):
             )
 
     def closeEvent(self, event):
-        # Save PID settings on exit
-        self.save_pid_settings()
         event.accept()
 
 def main():
