@@ -152,12 +152,12 @@ class simulateCoolingSchedule():
 
             def cooling_power_from_T(Tw):
                 """Return cooling power (W, negative) for current water temperature."""
-                poly_params = [2.27547663e-17, -1.12684201e-14, 2.11045586e-12, -1.52660048e-10,
-                               -3.27284087e-09, 9.72591370e-07, 1.61182038e-06, -5.78630618e-03,
-                               7.22094130e-02, 3.16146892e+01, -1.23925959e+03, -1.16861980e+05,
-                               1.27332931e+07, -5.16289868e+08, 1.01934107e+10, -8.17727003e+10]
-                if Tw < 50:
-                    return -120.0  # below melt range, basically no cooling
+                poly_params = [ 1.45564535e-16, -8.36699660e-14,  1.95721353e-11, -2.20243051e-09,
+                              7.91320781e-08,  7.81665961e-06, -7.93943640e-04, -1.55684570e-02,
+                              5.25720840e+00, -1.47036027e+02, -2.12071530e+04,  2.30111814e+06,
+                             -1.08558721e+08,  2.87372399e+09, -4.16863189e+10, 2.59829062e+11]
+                if Tw < 52:
+                    return 0  # below melt range, basically no cooling
                 if Tw > 82.5:
                     Tw = 82.5
 
@@ -325,9 +325,9 @@ class MatplotCanvas(FigureCanvasQTAgg):
         self.ax.set_xlabel("Time [min]")
         self.ax.set_ylabel("T [°C]")
         self.lines = {
-            "core":    self.ax.plot([], [], 'r-', label="Core")[0],
-            "surface": self.ax.plot([], [], 'm-', label="Surface")[0],
-            "water":   self.ax.plot([], [], 'b-', label="Water")[0],
+            "core":    self.ax.plot([], [], 'r-', label="Core", linewidth=2.0)[0],
+            "surface": self.ax.plot([], [], 'm-', label="Surface", linewidth=2.0)[0],
+            "water":   self.ax.plot([], [], 'b-', label="Water", linewidth=2.0)[0],
             "set":     self.ax.plot([], [], 'k--', label="Set‑point")[0],
             "core sim":   self.ax.plot([], [], 'r--', label="Core sim")[0],
             "surface sim": self.ax.plot([], [], 'm--', label="Surface sim")[0],
