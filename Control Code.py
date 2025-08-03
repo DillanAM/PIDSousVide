@@ -10,8 +10,12 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import csv
 import optuna
-from typing import Callable, Sequence, Union, Optional, Dict
 import scipy.stats as st
+import logging
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+logging.getLogger("optuna").setLevel(logging.WARNING)
+logging.getLogger("optuna").propagate = False
 
 GRAPH_INTERVAL = 1000           # ms between redraws
 CONTROL_INTERVAL = 2           # s between PID decisions
@@ -41,10 +45,10 @@ class simulateCoolingSchedule():
 
     def calculateParameters(self, time, Tc, Ts, Tw):
 
-        self.time = time
-        self.Tc = Tc
-        self.Ts = Ts
-        self.Tw = Tw
+        self.time = np.asarray(time, dtype=float)
+        self.Tc = np.asarray(Tc, dtype=float)
+        self.Ts = np.asarray(Ts, dtype=float)
+        self.Tw = np.asarray(Tw, dtype=float)
 
         # ---------------------------------------------------------------
         # 2)  Numerical derivatives  (central difference)
@@ -86,8 +90,8 @@ class simulateCoolingSchedule():
 
     def calculateEffectiveWaterMass(self, time, Tw):
 
-        self.time = time
-        self.Tw = Tw
+        self.time = np.asarray(time, dtype=float)
+        self.Tw = np.asarray(Tw, dtype=float)
 
         dTw_dt = np.gradient(self.Tw, self.time)
         # ---------------------------------------------------------------
@@ -124,7 +128,7 @@ class simulateCoolingSchedule():
                           Ta: float = 25.0,
                           Target_Core: float = self.target_core,
                           k_loss: float = 16.94,
-                          ) -> Dict[str, np.ndarray]:
+                          ):
 
             duration_s = 60 * 60  # 60 minutes
             dt = 1.0
@@ -214,7 +218,7 @@ class simulateCoolingSchedule():
                     "target_error": target_error, "target_time": target_time}
 
         def objective(trial):
-            hte = trial.suggest_int('hte', 0, 4000)
+            hte = trial.suggest_int('hte', 0, 3600)
 
             res = simulate_pork(hte)
 
@@ -224,9 +228,6 @@ class simulateCoolingSchedule():
 
         study = optuna.create_study(directions=['minimize', 'minimize'])
         study.optimize(objective, n_trials=500)
-
-        print(study.best_trials[0].values)
-        print(study.best_trials[0].params)
 
         hte = study.best_trials[0].params['hte']
 
@@ -340,7 +341,6 @@ class MatplotCanvas(FigureCanvasQTAgg):
             ("core", core),
             ("surface", surface),
             ("water", water),
-            ("set", np.full_like(core, setpoint))
             ]:
             self.lines[k].set_data(t / 60, y)
         for k, y in [
@@ -349,6 +349,7 @@ class MatplotCanvas(FigureCanvasQTAgg):
             ("water sim", water_sim)
              ]:
             self.lines[k].set_data(time_sim / 60, y)
+        self.ax.axhline(setpoint, color='k', linestyle='--')
         self.ax.relim()
         self.ax.autoscale_view()
         self.draw_idle()
@@ -369,7 +370,6 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tuning_tab, "PID Tuning")
 
         self.setup_control_tab()
-        self.setup_tuning_tab()
 
         self.setCentralWidget(self.tabs)
 
@@ -422,11 +422,11 @@ class MainWindow(QMainWindow):
         g.addWidget(self.sp_set, 3, 1)
 
         g.addWidget(self.lbl_core, 4, 0, 1, 2); g.addWidget(self.lbl_surface, 5, 0, 1, 2); g.addWidget(self.lbl_water, 6, 0, 1, 2)
-        g.addWidget(self.btn_start, 7, 0); g.addWidget(self.btn_stop, 8, 1)
-        g.addWidget(self.btn_heat, 9, 0); g.addWidget(self.btn_cool, 10, 1)
-        g.addWidget(self.btn_dwell, 11, 0); g.addWidget(self.btn_standby, 12, 1)
-        g.addWidget(self.btn_export, 13, 0, 1, 2)
-        g.addWidget(self.graph, 0, 2, 14, 1)
+        g.addWidget(self.btn_start, 7, 0); g.addWidget(self.btn_stop, 7, 1)
+        g.addWidget(self.btn_heat, 8, 0); g.addWidget(self.btn_cool, 8, 1)
+        g.addWidget(self.btn_dwell, 9, 0); g.addWidget(self.btn_standby, 9, 1)
+        g.addWidget(self.btn_export, 10, 0, 1, 2)
+        g.addWidget(self.graph, 0, 2, 11, 1)
 
         # ---------- signals ----------
         self.btn_probe.clicked.connect(lambda: asyncio.create_task(self.handle_probe()))
@@ -447,23 +447,6 @@ class MainWindow(QMainWindow):
         self.mode_changed(self.modeBox.currentText())
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(False)
-
-    def setup_tuning_tab(self):
-        layout = QVBoxLayout()
-        self.loop_select = QComboBox()
-        self.loop_select.addItems(["Core→Surface", "Surface→Water", "Water"])
-
-        self.load_csv_btn = QPushButton("Load Step Response")
-        self.result_label = QLabel("PID parameters will appear here.")
-        self.plot_canvas = MatplotCanvas(self)
-
-        self.load_csv_btn.clicked.connect(self.load_and_fit_csv)
-
-        layout.addWidget(self.loop_select)
-        layout.addWidget(self.load_csv_btn)
-        layout.addWidget(self.result_label)
-        layout.addWidget(self.plot_canvas)
-        self.tuning_tab.setLayout(layout)
 
     def mode_changed(self, text):
         is_manual = (text == "Manual")
@@ -600,7 +583,7 @@ class MainWindow(QMainWindow):
                                                                                               res['Ts'], res['Tw']]
                             print(f'Cooling Start Time: {coolingStart/60} min')
 
-                        if ((now - t0)%300) - (((now-dt) - t0)%300) < 0 and not mass_latch and heating_latch:
+                        if ((now - t0)%300) - (((now-dt) - t0)%300) < 0 and mass_latch and heating_latch:
                             print('Updating Prediction...')
                             self.simulator.calculateParameters(self.t, self.core, self.surface, self.water)
                             print(f'Conduction Coefficient: {self.simulator.a_hat} || Convection Coefficient: {self.simulator.b_hat}')
@@ -608,7 +591,7 @@ class MainWindow(QMainWindow):
                             coolingStart = res['cool start']
                             self.time_sim, self.core_sim, self.surface_sim, self.water_sim = [res['t'], res['Tc'],
                                                                                               res['Ts'], res['Tw']]
-                            print(f'Cooling Start Time: {coolingStart}')
+                            print(f'Cooling Start Time: {coolingStart/60} min')
 
                         if heating_latch and water < 82.5:
                             await self.cooker.heat()
