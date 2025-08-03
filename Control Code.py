@@ -127,7 +127,7 @@ class simulateCoolingSchedule():
                           Tw_max: float = 82.5,
                           Ta: float = 25.0,
                           Target_Core: float = self.target_core,
-                          k_loss: float = 16.94,
+                          k_loss: float = 14.0,
                           ):
 
             duration_s = 60 * 60  # 60 minutes
@@ -152,12 +152,12 @@ class simulateCoolingSchedule():
 
             def cooling_power_from_T(Tw):
                 """Return cooling power (W, negative) for current water temperature."""
-                poly_params = [2.27547663e-17, -1.12684201e-14, 2.11045586e-12, -1.52660048e-10,
-                               -3.27284087e-09, 9.72591370e-07, 1.61182038e-06, -5.78630618e-03,
-                               7.22094130e-02, 3.16146892e+01, -1.23925959e+03, -1.16861980e+05,
-                               1.27332931e+07, -5.16289868e+08, 1.01934107e+10, -8.17727003e+10]
-                if Tw < 50:
-                    return -120.0  # below melt range, basically no cooling
+                poly_params = [ 1.91623521e-16, -1.10127755e-13,  2.57564709e-11, -2.89761766e-09,
+                                1.04037491e-07,  1.02872508e-05, -1.04406660e-03, -2.05193041e-02,
+                                6.91400712e+00, -1.93107626e+02, -2.78978310e+04,  3.02512491e+06,
+                                -1.42658729e+08,  3.77503081e+09, -5.47401837e+10,  3.41056260e+11]
+                if Tw < 52:
+                    return 0  # below melt range, basically no cooling
                 if Tw > 82.5:
                     Tw = 82.5
 
@@ -325,9 +325,9 @@ class MatplotCanvas(FigureCanvasQTAgg):
         self.ax.set_xlabel("Time [min]")
         self.ax.set_ylabel("T [°C]")
         self.lines = {
-            "core":    self.ax.plot([], [], 'r-', label="Core")[0],
-            "surface": self.ax.plot([], [], 'm-', label="Surface")[0],
-            "water":   self.ax.plot([], [], 'b-', label="Water")[0],
+            "core":    self.ax.plot([], [], 'r-', label="Core", linewidth=3.0)[0],
+            "surface": self.ax.plot([], [], 'm-', label="Surface", linewidth=3.0)[0],
+            "water":   self.ax.plot([], [], 'b-', label="Water", linewidth=3.0)[0],
             "set":     self.ax.plot([], [], 'k--', label="Set‑point")[0],
             "core sim":   self.ax.plot([], [], 'r--', label="Core sim")[0],
             "surface sim": self.ax.plot([], [], 'm--', label="Surface sim")[0],
