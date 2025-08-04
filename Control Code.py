@@ -7,7 +7,7 @@ from PyQt5.QtCore import Qt, QTimer
 from bleak import BleakClient, BleakError
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 import matplotlib.pyplot as plt
-import pandas as pd
+from scipy.interpolate import PchipInterpolator
 import csv
 import optuna
 import scipy.stats as st
@@ -152,16 +152,21 @@ class simulateCoolingSchedule():
 
             def cooling_power_from_T(Tw):
                 """Return cooling power (W, negative) for current water temperature."""
-                poly_params = [ 1.91623521e-16, -1.10127755e-13,  2.57564709e-11, -2.89761766e-09,
-                                1.04037491e-07,  1.02872508e-05, -1.04406660e-03, -2.05193041e-02,
-                                6.91400712e+00, -1.93107626e+02, -2.78978310e+04,  3.02512491e+06,
-                                -1.42658729e+08,  3.77503081e+09, -5.47401837e+10,  3.41056260e+11]
-                if Tw < 52:
+                Tw_med = [64.725, 65.15, 65.61666667, 66.35, 66.8, 67.2, 67.7, 68.3, 69.6, 70.3, 71.15, 72.25, 73.4,
+                          74.35, 76.,
+                          78., 79., 80.65, 82.21, 82.7]
+                Pc_med = [-34.6927029, -124.97092194, -346.38955333, -696.22550052, -927.63652278, -1302.36990235,
+                          -1681.12659496,
+                          -1849.84280792, -1999.11749958, -2144.74028961, -2278.62155835, -2353.98138997,
+                          -2423.82046095, -2491.63877127,
+                          -2544.83632095, -2588.31310997, -2640.96913835, -2679.70440608, -2814.58564536,
+                          -2918.36965847]
+                if Tw < 64.725:
                     return 0  # below melt range, basically no cooling
                 if Tw > 82.5:
                     Tw = 82.5
-
-                return np.polyval(poly_params, Tw)
+                Pcool_T = PchipInterpolator(Tw_med, Pc_med, extrapolate=False)
+                return Pcool_T(Tw)
 
             Tw = np.empty(steps)
             Ts = np.empty(steps)
@@ -222,12 +227,12 @@ class simulateCoolingSchedule():
 
             res = simulate_pork(hte)
 
-            core_error, time = res['target_error'], res['target_time']
+            time = res['target_time']
 
-            return core_error, time
+            return time
 
-        study = optuna.create_study(directions=['minimize', 'minimize'])
-        study.optimize(objective, n_trials=500)
+        study = optuna.create_study(directions=['maximize'])
+        study.optimize(objective, n_trials=100)
 
         hte = study.best_trials[0].params['hte']
 
