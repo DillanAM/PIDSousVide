@@ -142,6 +142,9 @@ class simulateCoolingSchedule():
             cooler = np.zeros(N)
             cooler[hte:] = 1.0
 
+            WAX_ENERGY_FULL = 264000
+            wax_left = WAX_ENERGY_FULL
+
             def get_val(src, time_s, lo=0.0, hi=1.0):
                 if callable(src):
                     val = float(src(time_s))
@@ -153,14 +156,11 @@ class simulateCoolingSchedule():
             def cooling_power_from_T(Tw):
                 """Return cooling power (W, negative) for current water temperature."""
                 Tw_med = [64.725, 65.15, 65.61666667, 66.35, 66.8, 67.2, 67.7, 68.3, 69.6, 70.3, 71.15, 72.25, 73.4,
-                          74.35, 76.,
-                          78., 79., 80.65, 82.21, 82.7]
+                          74.35, 76., 78., 79., 80.65, 82.21, 82.7]
                 Pc_med = [-34.6927029, -124.97092194, -346.38955333, -696.22550052, -927.63652278, -1302.36990235,
-                          -1681.12659496,
-                          -1849.84280792, -1999.11749958, -2144.74028961, -2278.62155835, -2353.98138997,
-                          -2423.82046095, -2491.63877127,
-                          -2544.83632095, -2588.31310997, -2640.96913835, -2679.70440608, -2814.58564536,
-                          -2918.36965847]
+                          -1681.12659496, -1849.84280792, -1999.11749958, -2144.74028961, -2278.62155835, -2353.98138997,
+                          -2423.82046095, -2491.63877127, -2544.83632095, -2588.31310997, -2640.96913835, -2679.70440608,
+                          -2814.58564536, -2918.36965847]
                 if Tw < 64.725:
                     return 0  # below melt range, basically no cooling
                 if Tw > 82.5:
@@ -196,7 +196,10 @@ class simulateCoolingSchedule():
                     t_on_cool = 0.0
 
                 if chiller_on:
-                    Pc = cooling_power_from_T(Tw[k - 1])  # negative W
+                    Pc = cooling_power_from_T(Tw[k - 1])  # ≤ 0
+                    # limit by remaining wax energy
+                    Pc = max(Pc, -wax_left / dt)
+                    wax_left += Pc * dt  # Pc negative → decreases wax_left
                 else:
                     Pc = 0.0
 
