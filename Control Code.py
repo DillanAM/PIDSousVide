@@ -35,11 +35,12 @@ def exporter(time_s, core_temp, surface_temp, water_temp, set_temp, state, file_
         writer.writerow(["State", *state])
 
 class simulateCoolingSchedule():
-    def __init__(self, setpoint):
+    def __init__(self, setpoint, t0):
         self.time = None
         self.Tc = None
         self.Ts = None
         self.Tw = None
+        self.t0 = t0
         self.target_core = setpoint
 
 
@@ -114,6 +115,10 @@ class simulateCoolingSchedule():
 
     async def predictCoolingTime(self):
 
+        duration_s = 60 * 60 - self.t0  # 60 minutes
+        dt = 1.0
+        self.steps = int(duration_s / dt) + 1
+
         def simulate_pork(hte: int,
                           Tw0: float = self.Tw[0],
                           Ts0: float = self.Ts[0],
@@ -130,10 +135,8 @@ class simulateCoolingSchedule():
                           k_loss: float = 14.0,
                           ):
 
-            duration_s = 60 * 60  # 60 minutes
-            dt = 1.0
-            steps = int(duration_s / dt) + 1
-            t = np.arange(0, steps) * dt
+
+            t = np.arange(0, self.steps) * dt + self.t0
 
             N = int(duration_s / dt) + 1
             heater = np.zeros(N)
@@ -168,17 +171,19 @@ class simulateCoolingSchedule():
                 Pcool_T = PchipInterpolator(Tw_med, Pc_med, extrapolate=False)
                 return Pcool_T(Tw)
 
-            Tw = np.empty(steps)
-            Ts = np.empty(steps)
-            Tc = np.empty(steps)
-            u_heat = np.zeros(steps)
-            u_cool = np.zeros(steps)
+            Tw = np.empty(self.steps)
+            Ts = np.empty(self.steps)
+            Tc = np.empty(self.steps)
+            u_heat = np.zeros(self.steps)
+            u_cool = np.zeros(self.steps)
 
             Tw[0], Ts[0], Tc[0] = Tw0, Ts0, Tc0
+            tau_s = 240  # seconds, tweak
+            Tw_f = Tw[0]
             Cw = m_water * cp_water
             chiller_on = False
 
-            for k in range(1, steps):
+            for k in range(1, self.steps):
                 time_s = t[k]
 
                 # Heater duty
@@ -210,7 +215,8 @@ class simulateCoolingSchedule():
                     Tw[k] = Tw_max
 
                 # Pork nodes
-                dTs = b * (Tw[k] - Ts[k - 1]) - a * (Ts[k - 1] - Tc[k - 1])
+                Tw_f += (dt / tau_s) * (Tw[k - 1] - Tw_f)
+                dTs = b * (Tw_f - Ts[k - 1]) - a * (Ts[k - 1] - Tc[k - 1])
                 dTc = a * (Ts[k - 1] - Tc[k - 1])
                 Ts[k] = Ts[k - 1] + dTs * dt
                 Tc[k] = Tc[k - 1] + dTc * dt
@@ -220,13 +226,13 @@ class simulateCoolingSchedule():
             if len(time_idx[0]) == 0:
                 target_time = float(-99999)
             else:
-                target_time = t[time_idx[0][0]] / 60
+                target_time = (t[time_idx[0][0]]) / 60
 
             return {"t": t, "Tw": Tw, "Ts": Ts, "Tc": Tc, "u_heat": u_heat, "u_cool": u_cool, 'cool start': t[hte],
                     "target_error": target_error, "target_time": target_time}
 
         def objective(trial):
-            hte = trial.suggest_int('hte', 0, 3600)
+            hte = trial.suggest_int('hte', 0, self.steps-1)
 
             res = simulate_pork(hte)
 
@@ -372,10 +378,8 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.control_tab = QWidget()
-        self.tuning_tab = QWidget()
 
         self.tabs.addTab(self.control_tab, "Control")
-        self.tabs.addTab(self.tuning_tab, "PID Tuning")
 
         self.setup_control_tab()
 
@@ -401,7 +405,7 @@ class MainWindow(QMainWindow):
         self.lbl_cooker = QLabel("Cooker: ⬤ Disconnected")
 
         self.modeBox = QComboBox()
-        self.modeBox.addItems(["Manual", "Normal", "PID Auto"])
+        self.modeBox.addItems(["Manual", "Normal", "Automatic"])
         self.modeBox.currentTextChanged.connect(self.mode_changed)
 
         self.sp_set = QSpinBox(); self.sp_set.setRange(20, 82); self.sp_set.setValue(55)
@@ -458,7 +462,7 @@ class MainWindow(QMainWindow):
 
     def mode_changed(self, text):
         is_manual = (text == "Manual")
-        is_auto = (text == 'PID Auto')
+        is_auto = (text == 'Automatic')
         self.btn_heat.setEnabled(is_manual)
         self.btn_cool.setEnabled(is_manual)
         self.btn_dwell.setEnabled(is_manual)
@@ -523,7 +527,7 @@ class MainWindow(QMainWindow):
         self.surface_sim.clear()
         self.water_sim.clear()
 
-        self.simulator = simulateCoolingSchedule(setpoint)
+        self.simulator = simulateCoolingSchedule(setpoint, 0.0)
         mode = self.modeBox.currentText()
         self.running = True
         self.last_time = time.time()
@@ -572,7 +576,7 @@ class MainWindow(QMainWindow):
                         else:
                             await self.cooker.dwell()
 
-                    elif mode == "PID Auto":
+                    elif mode == "Automatic":
 
                         if coolingStart and (now - t0) > coolingStart:
                             heating_latch = False
@@ -581,25 +585,30 @@ class MainWindow(QMainWindow):
                         if (now - t0) >= 60*8 and not mass_latch and heating_latch:
 
                             self.simulator.calculateParameters(self.t, self.core, self.surface, self.water)
-                            print(f'Conduction Coefficient: {self.simulator.a_hat} || Convection Coefficient: {self.simulator.b_hat}')
+                            print(f'Conduction Coefficient: {self.simulator.a_hat:.2e} || Convection Coefficient: {self.simulator.b_hat:.2e}')
                             self.simulator.calculateEffectiveWaterMass(self.t, self.water)
                             mass_latch = True
-                            print(f'Effective Water Mass: {self.simulator.m_hat}')
+                            print(f'Effective Water Mass: {self.simulator.m_hat:.2f}')
                             res = await self.simulator.predictCoolingTime()
                             coolingStart = res['cool start']
                             self.time_sim, self.core_sim, self.surface_sim, self.water_sim = [res['t'], res['Tc'],
                                                                                               res['Ts'], res['Tw']]
-                            print(f'Cooling Start Time: {coolingStart/60} min')
+                            print(f'Cooling Start Time: {coolingStart/60:.2f} min')
 
-                        if ((now - t0)%300) - (((now-dt) - t0)%300) < 0 and mass_latch and heating_latch:
+                            self.simulator.t0 = now - t0
+
+                        if ((now - t0)%180) - (((now-dt) - t0)%180) < 0 and mass_latch and heating_latch:
                             print('Updating Prediction...')
-                            self.simulator.calculateParameters(self.t, self.core, self.surface, self.water)
-                            print(f'Conduction Coefficient: {self.simulator.a_hat} || Convection Coefficient: {self.simulator.b_hat}')
+                            start_idx = np.where(np.asarray(self.t) >= self.simulator.t0)
+                            self.simulator.calculateParameters(self.t[start_idx[0][0]:], self.core[start_idx[0][0]:], self.surface[start_idx[0][0]:], self.water[start_idx[0][0]:])
+                            print(f'Conduction Coefficient: {self.simulator.a_hat:.2e} || Convection Coefficient: {self.simulator.b_hat:.2e}')
                             res = await self.simulator.predictCoolingTime()
-                            coolingStart = res['cool start']
+                            coolingStart = res['cool start'] - self.simulator.t0
                             self.time_sim, self.core_sim, self.surface_sim, self.water_sim = [res['t'], res['Tc'],
                                                                                               res['Ts'], res['Tw']]
-                            print(f'Cooling Start Time: {coolingStart/60} min')
+                            print(f'Cooling Start Time: {coolingStart/60:.2f} min')
+
+                            self.simulator.t0 = now - t0
 
                         if heating_latch and water < 82.5:
                             await self.cooker.heat()
